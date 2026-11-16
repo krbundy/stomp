@@ -1,0 +1,942 @@
+# stomp: Design Specification
+
+**Status:** Draft v0.3 (2026-11-16)
+**Scope:** Behavior and architecture for the first releases. Open questions are listed in §24.
+
+**Changes since v0.2:**
+- The S3 destination targets DigitalOcean Spaces first (§13.3.7). Q4 is resolved.
+- Glacier and Deep Archive (M6) and splitting a job across grants (former Q6) are deferred.
+
+**Changes in v0.2:**
+- S3 added as an archive destination; the NAS is now one of several named destinations (§13).
+- New: Slurm compute jobs are attributed to grants (§15).
+- stomp's own Slurm work is renamed **tasks** (§14), so that **jobs** refers to the user's compute jobs.
+
+---
+
+## 1. Summary
+
+stomp is a command-line tool that runs as an ordinary user and ships as a single file. It helps an HPC user track the resources each of their **research grants** uses. It:
+
+- attributes **storage** usage to grants,
+- attributes **Slurm compute jobs** to grants (CPU hours and GPU hours),
+- tracks how usage **changes over time** and produces **reports** for grant budgets,
+- finds data worth compressing or archiving, using rules the user writes,
+- packs that data into **compressed archives**, either kept in place or sent to a **remote destination** (a NAS over SFTP, or S3-compatible object storage),
+- and **restores** archives on demand, including partial restores.
+
+Heavy work runs as **Slurm jobs** that stomp submits for the user. stomp needs no root access, no background service and no help from the HPC admins.
+
+## 2. Background
+
+- The HPC center reports usage only per user, not per project or grant. This is true for both storage and compute. Users funded by several grants have to work out each grant's share themselves, for budgets, progress reports and data management plans.
+- Home directories collect finished-project data, container sandboxes, package caches and millions of small files. Users have no tooling of their own to compress this data or move it to cheaper storage such as a NAS or S3.
+- Existing tools fall short for this user. Starfish, Robinhood, GUFI, archivetar and mpiFileUtils are commercial, run by admins, or cover only one piece. None of them maps usage to a user's own grants, attributes compute jobs, or sends data to SFTP or S3 destinations of the user's choosing.
+
+## 3. Goals and non-goals
+
+### Goals
+
+| ID | Goal |
+|----|------|
+| G1 | Per-grant storage usage, available instantly wherever the filesystem allows it. |
+| G2 | Per-grant compute usage, from explicit job logging and automatic inference. |
+| G3 | Usage history and change tracking. |
+| G4 | Grant-oriented reports (table, CSV, Markdown, HTML, JSON), including TB-months, CPU hours and GPU hours. |
+| G5 | Rule-driven discovery of archive candidates; propose or perform compression. |
+| G6 | Safe archive and restore, locally or at remote destinations (SFTP, S3), with partial restores. |
+| G7 | Everything runs as the user: no root, no background service, no admin involvement. |
+| G8 | Easy for colleagues to adopt: one static binary, and `stomp init` gets a new user going in minutes. |
+| G9 | Good citizen on shared systems: heavy work goes to Slurm, and load on the metadata server and the accounting database is limited. |
+| G10 | Archives can be restored with standard tools (`tar`, `zstd`, `sha256sum`) even without stomp. |
+
+### Non-goals
+
+- **Not an admin or site-wide tool.** stomp manages only one user's data and jobs.
+- **Not a backup system.** Archiving *moves* data: after archiving to a remote destination, that copy is the only copy.
+- **Not a sync tool.** There is no two-way mirroring.
+- **Not a billing system.** stomp can estimate cost from configured rates but does not invoice anyone.
+- **Not a job submission wrapper.** stomp records which grant a job belongs to; it does not change how jobs are submitted.
+
+## 4. Environment and constraints
+
+Known facts about the target cluster as of this draft:
+
+| Item | Observed | Consequence |
+|------|----------|-------------|
+| `/home` | CephFS (kernel client), ~3.1 PB shared | Ceph's built-in directory totals give fast usage numbers (§6.1). |
+| Quotas | `quota -s` and `lfs quota` report nothing | Any quota is exposed as `ceph.quota.*` attributes. |
+| Scheduler | Slurm | Heavy commands submit tasks (§14); compute attribution reads `sacct` (§15). |
+| NAS | User has previously downloaded from the NAS inside a Slurm job | SFTP transfers can probably run inside tasks. |
+| S3 | User keeps some data in DigitalOcean Spaces (S3-compatible) | S3 destination, built and tested against Spaces first (§13.3). |
+| Privileges | Ordinary user | No admin-only filesystem or Slurm features. |
+| File counts | Very large (tens of millions or more in one directory tree) | No per-file records in the catalog by default (§9.3). |
+
+Constraints:
+
+- **C1.** stomp's own data lives in the user's quota, so the catalog must stay small (§10.3).
+- **C2.** The CephFS metadata server and Slurm's accounting database are shared by everyone. Scans must limit how many files they examine in parallel, and `sacct` queries must cover bounded time windows.
+- **C3.** Only cheap operations may run on login nodes.
+- **C4.** Slurm jobs have wall-time limits, so every long operation must save progress and be able to resume.
+- **C5.** SQLite's file locking can't be trusted on a network filesystem, so only one process may write the catalog (§10.2).
+- **C6.** Compute nodes may not have outbound internet access. A destination that is reachable from a login node may not be reachable from a task (§13.4).
+
+## 5. Concepts
+
+- **Root:** a top-level directory stomp manages, such as `~` or a project space. A user can have several. Roots may not be nested inside each other.
+- **Grant:** a funding source with metadata (ID, title, PI, start and end dates) and one or more grant directories. The grant is the central unit everything is reported against.
+- **Grant directory:** a directory whose entire subtree is attributed to one grant. A grant may have several directories; a directory belongs to at most one grant.
+- **Unassigned:** storage or compute that can't be attributed to any grant.
+- **Excluded directory:** a directory that is counted in usage but never scanned in detail or archived. There are four kinds:
+  - *environment:* container sandboxes, conda environments, Python venvs
+  - *cache:* known package and container caches
+  - *user:* directories matching the user's own glob patterns
+  - *stomp:* stomp's own data and staging directories
+- **Usage sample:** a timestamped storage measurement of (path, bytes, files).
+- **Scan:** a detailed walk of the directory tree that records per-directory totals.
+- **Archive:** one directory packed into one or more **chunks** (`.tar.zst` files) plus a manifest. It is stored locally or at a destination.
+- **Destination:** a named remote place where archives can be stored, of type `sftp` or `s3` (§13).
+- **Policy:** a rule that selects archive candidates and either proposes or applies an action.
+- **Proposal:** a candidate archive action produced by a policy and waiting for the user's approval.
+- **Compute job:** one of the user's own Slurm jobs. It is attributed to a grant explicitly or by its working directory (§15).
+- **Task:** a Slurm job that stomp submits for its own work (scan, archive, restore, transfer) and tracks.
+
+## 6. Filesystem backends
+
+Filesystem access goes through a common interface:
+
+- `dir_usage(path) -> Option<Usage { bytes, files, subdirs, rctime }>`: instant on CephFS; on other filesystems, `None`.
+- `quota(path) -> Option<Quota { max_bytes, max_files }>`
+- `walk(root, options)`: a parallel directory walk with limited concurrency (§9).
+
+### 6.1 Ceph backend
+
+**Detection.** The `statfs` filesystem type is `0x00c36400` (kernel client), or reading `ceph.dir.rbytes` on the root succeeds (which also covers `ceph-fuse`).
+
+CephFS keeps running totals for every directory and exposes them as virtual extended attributes. Any user can read them with no tree walk:
+
+| Attribute | Meaning |
+|-----------|---------|
+| `ceph.dir.rbytes` | Total bytes in the subtree (logical file sizes) |
+| `ceph.dir.rfiles` | Total files in the subtree |
+| `ceph.dir.rsubdirs` | Total subdirectories in the subtree |
+| `ceph.dir.rctime` | Newest change time (ctime) anywhere in the subtree |
+| `ceph.quota.max_bytes`, `ceph.quota.max_files` | Quota limits, if one is set on this directory |
+
+**What stomp uses them for:**
+
+- Instant usage for each grant directory, root and excluded directory (§8).
+- Incremental scans: a subtree that hasn't changed since the last scan is skipped (§9.2).
+- Finding archive candidates without a scan: `rbytes / rfiles` is the average file size, and directories full of small, old files are the best candidates.
+- Checking quota headroom before archiving (§12.4).
+- A live `du` and the TUI (§17, §19).
+
+**Caveats:**
+
+- **The totals are updated lazily**, so they can lag behind recent writes. Reports print the measurement time. **Nothing destructive ever relies on these totals**; deleting originals requires checksum verification (§12.4).
+- **`rbytes` counts logical size.** Sparse files count at full size, and the extra raw space Ceph uses to store copies of the data is not included. That is the right number for attributing usage to grants.
+- **The lag can make an incremental scan miss a change.** If a directory's change time is updated only after a scan has started, the next scan could skip a subtree that did change. Two measures prevent this: a safety margin on comparisons, and periodic full rescans (§9.2).
+- **CephFS snapshots live in `.snap` directories.** stomp never enters them, and `rbytes` does not include snapshot data.
+
+### 6.2 POSIX backend
+
+This backend is used for roots that are not on CephFS, and on other clusters. It has no instant usage, so usage numbers come from the most recent scan. Scans cannot skip unchanged subtrees, so every scan is a full walk.
+
+## 7. Configuration
+
+### 7.1 Files and locations
+
+stomp follows the XDG conventions (`$XDG_CONFIG_HOME` and `$XDG_DATA_HOME` override the defaults):
+
+```
+~/.config/stomp/config.toml        configuration (grants, roots, destinations, policies, Slurm)
+~/.local/share/stomp/              catalog, inbox, task files, manifests (§10)
+```
+
+### 7.2 Example
+
+```toml
+[general]
+roots = ["~"]                        # add other directories as needed
+# staging_dir = "/scratch/$USER/stomp" # where chunks are built before upload; default: inside the archived directory
+# rate_per_tb_month  = 0.0           # optional rates; enable cost estimates in reports
+# rate_per_cpu_hour  = 0.0
+# rate_per_gpu_hour  = 0.0
+
+[slurm]
+account   = "myaccount"
+partition = "standard"
+time      = "12:00:00"
+cpus      = 8
+mem       = "16G"
+auto_resubmit = true                 # continue long tasks after a wall-time limit
+
+[scan]
+max_threads   = 8                    # cap on parallel file lookups; protects the shared metadata server
+full_every    = "30d"                # periodic full rescan (Ceph); see §9.2
+rctime_margin = "1h"
+exclude = [                          # user exclusions (glob patterns)
+  "**/node_modules",
+  "**/__pycache__",
+]
+# environment and cache detection is built in; see §9.4
+
+[archive]
+chunk_size = "50GiB"
+zstd_level = 3
+only_owned = true                    # never archive or delete files owned by other users
+default_destination = "nas"          # used when `stomp archive --to` is not given; "local" is also valid
+
+[compute]
+infer_from_workdir = true            # attribute jobs by working directory (§15.2)
+history_start = 2025-01-01           # how far back to import accounting records on first sync
+
+[[destination]]
+name   = "nas"
+type   = "sftp"
+host   = "nas"                       # a Host alias from ~/.ssh/config works
+path   = "/archive/$USER"
+parallel_uploads = 4
+verify = "remote-sha256"             # "remote-sha256" | "readback" | "size"; see Q1
+
+[[destination]]
+name     = "spaces"
+type     = "s3"
+endpoint = "https://nyc3.digitaloceanspaces.com"   # DigitalOcean Spaces; omit for AWS
+region   = "us-east-1"                 # Spaces ignores it, but the SDK requires one
+bucket   = "my-lab-archive"
+prefix   = "stomp/$USER"
+profile  = "spaces"                    # profile in ~/.aws/credentials holding the Spaces key
+# force_path_style = true              # needed by some other S3-compatible services
+# storage_class = "STANDARD"           # AWS only; cold classes are deferred (§13.3.5)
+parallel_uploads = 4
+verify = "server-checksum"             # "server-checksum" | "readback" | "size"
+
+[[grant]]
+id    = "GRANT-A"
+title = "Example grant A"
+pi    = "Dr. Example"
+start = 2024-07-01
+end   = 2027-06-30
+dirs  = ["~/project_alpha"]
+
+[[grant]]
+id    = "GRANT-B"
+title = "Example grant B"
+end   = 2025-12-31
+dirs  = ["~/project_beta", "~/project_beta_runs"]   # one grant, two directories
+
+[[policy]]
+name        = "archive-ended-grants"
+match       = { grant_ended_for = "90d" }
+action      = "propose"              # "propose" (default) | "apply"
+destination = "spaces"               # a destination name, or "local"
+
+[[policy]]
+name        = "pack-stale-small-files"
+match       = { unchanged_for = "180d", min_files = 10000, max_avg_file_size = "1MiB" }
+action      = "propose"
+destination = "local"
+```
+
+### 7.3 Validation rules
+
+- Expand `~` and `$USER`, then canonicalize all paths.
+- Roots may not be nested inside other roots.
+- Every grant directory must be inside a root.
+- A directory claimed by two grants is an **error**. So is one grant's directory nested inside another grant's directory.
+- One grant directory nested inside another directory of the same grant is a **warning**, because it is redundant.
+- A grant directory that doesn't exist is a **warning**: it may have been archived or renamed.
+- Destination names must be unique, and `local` is reserved. Every destination named in `default_destination` or in a policy must exist.
+
+### 7.4 `stomp init`
+
+`stomp init` gets a new user started:
+
+1. Proposes roots (default `~`) and detects the backend for each one.
+2. Lists the top-level directories of each root by size and file count. On Ceph this is instant.
+3. Flags excluded directories it detects (environments, caches).
+4. Writes a `config.toml` skeleton with one commented-out `[[grant]]` stub per large top-level directory, ready for the user to fill in.
+5. If `~/.ssh/config` or `~/.aws/config` exists, adds commented-out `[[destination]]` stubs.
+6. Never overwrites an existing config.
+
+## 8. Storage attribution
+
+### 8.1 Algorithm (Ceph)
+
+For each root `R`:
+
+```
+total(R)       = rbytes(R)
+usage(d)       = rbytes(d)                for each grant directory d in R
+grant(g)       = Σ usage(d)               over g.dirs
+unassigned(R)  = total(R) − Σ usage(d)    over the grant directories in R
+```
+
+The same calculation is done for file counts (`rfiles`).
+
+The validation rules in §7.3 ensure grant directories never overlap, so this subtraction is exact. Excluded directories found by the last scan are measured with `rbytes` too. Reports show them as "of which" lines inside their grant (or inside unassigned), not as separate grants.
+
+On a POSIX backend the same calculation uses totals from the most recent scan.
+
+### 8.2 Samples and history
+
+- Every `stomp usage` run records a usage sample for each root and grant directory. The scheduled task (§14.4) also records one.
+- **TB-months:** usage is added up over time between samples. If a period has gaps longer than `2 × schedule interval`, its numbers are marked *estimated*.
+- If `rate_per_tb_month` is set, reports also show an estimated cost.
+- **Remapping a directory re-attributes its history.** Samples are stored per path and assigned to grants using the *current* config, so moving a directory to a different grant moves its whole history. The same applies to compute jobs attributed by working directory (§15.2). Mappings with effective dates are a possible later addition (§25).
+
+### 8.3 Remote holdings
+
+For each grant and destination, the catalog records archived bytes (original and compressed sizes). Reports show these as separate storage tiers.
+
+### 8.4 Example
+
+```
+$ stomp usage
+Root ~  (CephFS, measured 2026-11-16 14:52, quota 50.0 TiB, 61% used)
+
+GRANT          DIRS   SIZE       FILES         EXCLUDED     LAST CHANGE
+GRANT-A        1      12.4 TiB   38,112,004    1.1 TiB      2h ago
+GRANT-B        2       8.9 TiB    2,004,551    —            3d ago
+GRANT-C        1       3.2 TiB      410,220    220 GiB      41d ago
+(unassigned)   —       6.1 TiB    9,880,112    2.4 TiB      5h ago
+TOTAL                 30.6 TiB   50,406,887
+
+Remote:  nas     GRANT-B 4.2 TiB (2.9 TiB compressed), 3 archives
+         spaces  GRANT-C 1.1 TiB (0.7 TiB compressed), 1 archive
+```
+
+## 9. Scanning
+
+### 9.1 Purpose
+
+A scan collects what Ceph's totals can't provide:
+
+- age and size profiles
+- file types
+- largest files
+- archive candidates
+- excluded-directory discovery
+- directory-level change tracking
+
+### 9.2 Behavior
+
+- **Walk.** Each root is walked in parallel with at most `scan.max_threads` threads. When running in a task, this is also capped by `SLURM_CPUS_PER_TASK`.
+- **Never follow symlinks, and never cross into another filesystem** (detected by a change in `st_dev`). Never enter `.snap`.
+- **Excluded directories** are recorded with their size and not entered (§9.4).
+- **Unreadable directories** are recorded with the error and skipped.
+- **Incremental (Ceph only).** If a subtree's change time is older than (previous scan start − `rctime_margin`), it is skipped and its totals from the previous scan are reused.
+- **Full rescan.** A full rescan runs every `scan.full_every`, or on request with `--full`. This catches anything the lag described in §6.1 caused an incremental scan to miss.
+- **Resumable.** stomp asks Slurm to signal the task shortly before its wall-time limit (`--signal=B:USR1@300`). On that signal, the scan saves a checkpoint listing the subtrees it has finished and exits marked *incomplete*. `stomp scan --resume`, or an automatic resubmit, continues from the checkpoint.
+
+### 9.3 What is recorded
+
+The catalog stores totals **per directory, not per file**. Tens of millions of per-file rows would use gigabytes of the user's own quota for every scan.
+
+For each recorded directory:
+
+- path, parent, grant
+- bytes and files, both directly inside the directory and in its whole subtree
+- newest and oldest mtime
+- age breakdown by bytes and by file count: `<30d`, `30–90d`, `90d–1y`, `1–3y`, `>3y`
+- size breakdown: `<4K`, `4K–1M`, `1M–100M`, `100M–10G`, `>10G`
+
+For each grant and each root:
+
+- the top 20 file extensions by bytes
+- the 100 largest files
+
+**Small directories are folded into their parent.** A directory under 1 MiB that also has fewer than 100 files is not stored separately; its numbers are added to its parent's (both thresholds are configurable). This bounds catalog size on trees with many tiny directories.
+
+**Optional per-file index.** Setting `track_files = true` on a grant directory, or on any directory, records every file in it. This allows exact file-level change lists for small, important trees.
+
+`atime` (last access time) is recorded only as a hint, because it may not be updated reliably on CephFS. All age rules use `mtime` and the change time.
+
+### 9.4 Excluded directories
+
+| Kind | Detected by |
+|------|-------------|
+| environment | a `.singularity.d/` entry (Apptainer/Singularity sandbox), `conda-meta/` (conda env) or `pyvenv.cfg` (venv) |
+| cache | known paths: `~/.cache`, `~/.apptainer/cache`, `~/.singularity/cache`, `~/.conda/pkgs` |
+| user | glob patterns in `scan.exclude` |
+| stomp | stomp's own data directory and staging directory |
+
+Excluded directories are:
+
+- **counted** in usage, at full size,
+- **not entered** by detailed scans,
+- **never archived**. If an archive target contains one, it is left in place and listed in the manifest's skipped section.
+
+Caches are shown as *reclaimable*, along with the command that cleans them (for example `apptainer cache clean` or `conda clean -a`).
+
+## 10. Catalog and state
+
+### 10.1 Layout
+
+```
+~/.local/share/stomp/
+  catalog.db                 SQLite; written only by the foreground CLI
+  catalog.lock               lock file for ingestion
+  inbox/                     task results waiting to be ingested
+  inbox/jobs/                compute-job log records (§15.1)
+  tasks/<task-id>/           generated sbatch script, logs, progress journal, checkpoint
+  manifests/<archive-id>/    local copies of archive manifests
+```
+
+stomp creates all of these with mode `0700` or `0600`.
+
+### 10.2 Only one process writes the catalog
+
+- **SQLite is built into the binary** and uses rollback-journal mode, not WAL. WAL needs shared memory, which isn't reliable on a network filesystem.
+- **Neither tasks nor `stomp jobs log` ever write `catalog.db`.** They write self-contained files to `inbox/`. Tasks also keep a progress journal in `tasks/<id>/`.
+- **The next CLI command ingests the inbox** before doing anything else, holding an `flock` on `catalog.lock` while it does. `stomp ingest` does the same thing explicitly.
+- **`stomp tasks` shows live progress** by reading the task journals without changing them.
+
+### 10.3 Tables and retention
+
+Main tables:
+
+- `grants`: a snapshot of the config at each ingest
+- `usage_samples`
+- `scans` and `dir_stats`
+- `excluded_dirs`
+- `destinations`
+- `archives`, `chunks` and `archive_events`
+- `proposals`
+- `tasks`
+- `compute_jobs`: accounting records copied from `sacct`
+- `job_tags`: explicit grant assignments
+
+Per-file manifests are stored as files, not as rows. The catalog indexes only chunks and path prefixes.
+
+Retention, configurable:
+
+| Data | Kept |
+|------|------|
+| Per-directory detail | the last 4 scans, plus one scan per month for 12 months |
+| Per-grant and per-root summaries | forever |
+| Usage samples | forever (they are tiny) |
+| Compute job records and tags | forever (about one row per job) |
+
+**Target:** the catalog stays under a few hundred MB for a user with tens of millions of files. `stomp doctor` reports the catalog's size.
+
+## 11. Change tracking
+
+There are three levels:
+
+1. **Quick (Ceph, instant).** Compares the current totals and change times of roots and grant directories with the last sample, and lists which grants changed since then and by how much. This is the default output of `stomp changes`.
+2. **Directory-level.** Compares two scans and shows new and removed directories and the largest growth and shrinkage, by grant, down to a chosen depth:
+   `stomp changes --since 30d [--grant G] [--depth N]`
+3. **File-level.** Lists added, removed and modified files, only in directories with `track_files = true`.
+
+stomp keeps a log of its own actions (archive, restore, deletion of originals). A drop in usage caused by archiving is labeled as such instead of looking like data loss.
+
+## 12. Archiving
+
+### 12.1 Modes
+
+- **local:** compress in place. After archiving, directory `D` contains `D/STOMP_ARCHIVED.txt` and `D/.stomp-archive/<archive-id>/` holding the chunks, manifest, `SHA256SUMS` and `README.txt`. The usage stays attributed to `D`'s grant.
+- **remote** (`--to <destination>`): the chunks are uploaded to a destination (§13). `D` keeps only `STOMP_ARCHIVED.txt`, plus any files that were skipped.
+- **move:** `stomp archives move <id> --to <destination>` sends an existing local archive to a destination without compressing it again. It can also move an archive from one destination to another (for example NAS → S3). Data passes through the HPC: download, verify, upload, verify, then delete from the old location.
+
+The `STOMP_ARCHIVED.txt` note explains in plain language what happened: when, by whom, where the data went, and how to restore it with or without stomp. Collaborators browsing the directory are never left guessing.
+
+### 12.2 Format
+
+- **Chunks:** `chunk-0001.tar.zst`, …
+  - POSIX tar (PAX format, for long names and precise timestamps), compressed with zstd (default level 3, multithreaded).
+  - Each chunk is self-contained and can be extracted on its own.
+  - Target size is `archive.chunk_size`. A file is never split across chunks; a file larger than the target goes into a chunk by itself.
+  - Files are packed in sorted path order, so a subdirectory lands in as few chunks as possible and partial restores fetch only a few chunks.
+- **`manifest.jsonl.zst`:**
+  - A header record holding the archive ID, source path, grant, user, host, stomp version, creation time and totals.
+  - One record per entry holding the relative path (base64 if not valid UTF-8), type, size, mode, mtime, uid, gid, chunk number and, for files, a BLAKE3 hash.
+  - A *skipped* section listing what was left in place and why.
+  - Readable with `zstdcat manifest.jsonl.zst | jq`.
+- **`SHA256SUMS`:** checksums of every chunk and the manifest, checkable with `sha256sum -c`.
+- **`README.txt`:** instructions for restoring without stomp:
+
+  ```
+  sha256sum -c SHA256SUMS && for c in chunk-*.tar.zst; do zstd -dc "$c" | tar -x; done
+  ```
+
+**Archive IDs** look like `<grant>-<yyyymmdd>-<6 hex characters>`, for example `GRANT-B-20261116-a3f9c2`.
+
+The layout is the same everywhere: in `.stomp-archive/` for local archives, and at every destination.
+
+### 12.3 What is included
+
+- **Archived:** regular files, directories, symlinks (stored as links and never followed) and hard links (preserved within the archive).
+- **Left in place and listed in the manifest's skipped section:**
+  - excluded directories (§9.4)
+  - files owned by other users (when `only_owned = true`, the default)
+  - sockets, FIFOs and device files
+  - unreadable files
+- **`stomp archive --estimate`** compresses a sample of the files and predicts the compressed size, the reduction in file count and how long the task will take, before anything is committed. zstd stores data that won't compress without spending much CPU, so stomp doesn't sort files by type.
+
+### 12.4 Procedure and safety invariants
+
+Each chunk goes through these steps, and every step is written to a journal:
+
+```
+PLAN → WRITE → VERIFY_LOCAL → [remote: UPLOAD → VERIFY_REMOTE → DELETE_LOCAL_CHUNK] → DELETE_SOURCES → DONE
+```
+
+- **WRITE** builds the chunk with tar and zstd. While writing, it hashes each file's bytes as they are read (BLAKE3) and hashes the chunk as it is written (SHA-256).
+- **VERIFY_LOCAL** reads the chunk back, decompresses it, recomputes every file's BLAKE3 hash and compares them.
+- **UPLOAD and VERIFY_REMOTE** depend on the destination type (§13).
+- **A remote archive is complete only once its manifest exists.** The manifest, `SHA256SUMS` and `README.txt` are uploaded last, after every chunk has been verified. An archive directory without a manifest is incomplete, so a crash never leaves something that looks finished but isn't.
+
+**Invariants:**
+
+| ID | Invariant |
+|----|-----------|
+| I1 | No source file is deleted until the chunk that holds it has passed verification at its final destination. |
+| I2 | Just before deleting a source file, stomp checks it again. If its size, mtime or ctime has changed since it was archived, the file is kept and flagged *changed during archive* in the manifest and the report. |
+| I3 | A directory is removed only when it is empty after its files have been deleted. stomp never deletes a whole tree recursively. |
+| I4 | Every destructive step is recorded in the journal before and after it runs. A killed task resumes from the journal and never deletes or uploads twice. |
+| I5 | Destructive commands show a plan and ask for confirmation (`--yes` for non-interactive use). `--dry-run` works on every command. |
+| I6 | stomp modifies nothing outside the archive target, its data directory, its staging directory and its paths at the destinations. |
+
+**Space headroom.** Each chunk is finished before the next begins, so the extra space needed is about `chunk_size × chunks in progress`, not the size of the whole directory. Before starting, stomp compares this with the quota headroom (`ceph.quota.*`, if set) and refuses to start if there isn't enough room. Chunks can be built in a `staging_dir` such as scratch.
+
+### 12.5 Restore
+
+`stomp restore <archive-id | path> [--only <glob>] [--to <dir>] [--overwrite] [--delete-remote]`
+
+- The manifest identifies which chunks are needed. Only those chunks are downloaded and extracted.
+- Each chunk's SHA-256 is checked after download, and each file's BLAKE3 hash after extraction.
+- **By default, data is restored to its original location.** Existing files are never overwritten without `--overwrite`. `--to` restores somewhere else.
+- File mode and mtime are restored. The restored files are owned by the user running the restore.
+- After a complete, verified restore:
+  - local archive chunks are removed, since the original data is back,
+  - the remote copy is kept unless `--delete-remote` is given.
+- If the chunks are in a cold S3 storage class, the restore runs in two phases (§13.3.5).
+
+## 13. Remote destinations
+
+### 13.1 Common interface
+
+Every destination type implements the same operations:
+
+- `put`: resumable, and atomic as far as the destination allows
+- `verify`
+- `get`: the whole object or a byte range
+- `list`
+- `delete`
+- `usage`: the space the user's stomp archives take up there
+
+**Layout** is identical across destination types:
+
+```
+<base>/<grant-id>/<archive-id>/
+    README.txt
+    manifest.jsonl.zst
+    SHA256SUMS
+    chunk-0001.tar.zst
+    ...
+```
+
+`<base>` is `path` for SFTP and `s3://<bucket>/<prefix>` for S3.
+
+**Re-checking.** `stomp archives verify <id> --remote` checks a remote archive again at any time.
+
+### 13.2 SFTP
+
+- **Transport.** stomp runs the system's OpenSSH `ssh` and `sftp` programs as subprocesses rather than embedding an SSH library. This reuses the user's working `~/.ssh/config` (host aliases, ProxyJump, keys, ssh-agent, known_hosts) and keeps cryptography out of the static binary. stomp always passes `-o BatchMode=yes`, so a task fails quickly instead of hanging at a password prompt.
+- **Uploads.** Each file is uploaded to `*.partial` and renamed only after it passes verification. Interrupted uploads resume with OpenSSH's `reput`.
+- **Throughput.** stomp runs `parallel_uploads` sftp sessions at once; a single SFTP stream is slow.
+- **Verification** (`verify`), which depends on Q1:
+  - `remote-sha256`: run `sha256sum` on the server over `ssh`. This needs shell access to the server.
+  - `readback`: download the file again over SFTP and hash it locally. This works on SFTP-only servers but doubles the transfer.
+  - `size`: compare file sizes only. This is weak, so it must be chosen explicitly.
+
+  `stomp doctor` detects which of these works.
+
+### 13.3 S3
+
+#### 13.3.1 Client
+
+- **Library.** stomp uses the AWS SDK for Rust (`aws-sdk-s3`), compiled in behind a cargo feature `s3` that is on by default.
+- **Credentials and settings.** The SDK reads the user's existing `~/.aws/config` and `~/.aws/credentials` files, profiles and `AWS_*` environment variables natively. This is the same reuse-what-already-works reasoning as SFTP (D6), and no extra programs are needed.
+- **S3-compatible services** (DigitalOcean Spaces, campus Ceph object storage, MinIO, Wasabi and others) are supported with `endpoint` and, where needed, `force_path_style`.
+
+#### 13.3.2 Uploads
+
+- **Chunks are uploaded in parts** (multipart upload), with parts uploaded in parallel up to `parallel_uploads`.
+  - Part size is the larger of 64 MiB and `chunk_size / 9000`, which stays under S3's limit of 10,000 parts.
+  - The upload ID is recorded in the journal. An interrupted upload resumes by listing the parts already uploaded.
+- **Atomic.** An S3 object becomes visible only when its multipart upload is completed, so no `.partial` naming is needed.
+- **Cleanup.** stomp aborts the incomplete uploads it started when an archive is cancelled. The docs recommend a bucket lifecycle rule that aborts incomplete multipart uploads after a few days, as a backstop.
+- **Metadata.** Each chunk is stored with `x-amz-meta-stomp-sha256` (the whole chunk's SHA-256) and `x-amz-meta-stomp-archive` (the archive ID).
+
+#### 13.3.3 Verification (`verify`)
+
+- **`server-checksum`** (default): every part is sent with a checksum that the server checks on arrival, rejecting any mismatch. stomp uses the strongest kind the server enforces:
+  1. a SHA-256 checksum (`x-amz-checksum-sha256`), or
+  2. `Content-MD5`, which almost every S3-compatible service enforces.
+
+  Some services silently ignore checksum headers. `stomp doctor` finds out which kind the server actually enforces: it uploads a small object with a deliberately wrong checksum of each kind and confirms the upload is rejected. If the server enforces neither, stomp refuses to use `server-checksum` for that destination.
+- **`readback`:** download the object again and hash it locally. This costs download traffic, which AWS charges for.
+- **`size`:** compare sizes only. This is weak, so it must be chosen explicitly.
+
+#### 13.3.4 Restores
+
+- Only the needed chunks are fetched, as with SFTP.
+- Downloads use parallel byte-range requests for throughput.
+
+#### 13.3.5 Cold storage classes (deferred; AWS only)
+
+Spaces has no cold storage classes, so this section applies only to an AWS destination. It is deferred to M6.
+
+Objects in GLACIER, DEEP_ARCHIVE and similar classes must be *thawed* before they can be downloaded, which takes minutes to 48 hours. With a cold class:
+
+- **Small files stay readable.** The manifest, `SHA256SUMS` and `README.txt` are always stored in STANDARD, so listing and restore planning never need a thaw.
+- **Restores run in two phases.** `stomp restore` sends thaw requests for the needed chunks and records the restore as *thawing*. Later, `stomp restore --resume <id>` (or the scheduled task) downloads the chunks once they are available.
+- **`stomp archive --estimate` shows costs.** It lists storage, request and retrieval costs, including minimum storage durations: 90 days for Glacier Flexible Retrieval, 180 days for Deep Archive. Larger chunks mean fewer requests.
+
+#### 13.3.6 Credentials in tasks
+
+Long-lived access keys or an assumed-role profile work in tasks. Short-lived credentials, such as SSO sessions, can expire partway through a long task. `stomp doctor` and task submission both warn when the credentials will expire before the task's time limit.
+
+#### 13.3.7 DigitalOcean Spaces
+
+Spaces is the first S3 service stomp targets, because the user already keeps data there.
+
+- **Endpoint:** `https://<region>.digitaloceanspaces.com`, for example `nyc3`. The SDK's `region` is set to `us-east-1`; Spaces ignores it, but the SDK requires a value.
+- **Credentials:** a Spaces access key, stored as a profile in `~/.aws/credentials`. These keys don't expire, so they work in long tasks.
+- **SDK checksum defaults:** recent AWS SDKs add CRC checksums to uploads and downloads by default, and some S3-compatible services reject them. For endpoints that aren't AWS, stomp sets the SDK to send checksums only when required, and adds the checksum kind that `doctor` selected (§13.3.3) itself.
+- **Rate limits:** Spaces limits request rates. stomp keeps `parallel_uploads` modest and retries with backoff when the server answers `503 SlowDown`.
+- **Costs:** Spaces bills outbound transfer beyond the plan's allowance, so `readback` verification costs money. `server-checksum` is preferred.
+- **No storage classes:** `storage_class` is ignored, and cold storage (§13.3.5) isn't available.
+- **Reachability:** Spaces is on the public internet, so compute nodes may not be able to reach it (§13.4). `stomp doctor --submit` will tell.
+
+### 13.4 Reachability from compute nodes
+
+A destination that works from a login node may not work from a compute node. For example, AWS endpoints need outbound internet access, which many clusters block on compute nodes.
+
+- `stomp doctor --submit` runs the destination checks in a short task on a compute node.
+- If a destination can't be reached from compute nodes, its transfer steps run separately from compression:
+  - the task compresses and verifies the chunks locally,
+  - then `stomp archives push <id>` uploads them from a login or data-transfer node, after a warning. This step mostly waits on the network rather than the CPU.
+
+## 14. Slurm integration (stomp's own tasks)
+
+### 14.1 Where commands run
+
+- **Heavy commands** are `scan`, `archive`, `restore`, `archives verify --remote` and `archives move`.
+  - Run outside a Slurm job, they submit a **task** by default and print its ID.
+  - `--here` runs them in the foreground instead, with a warning if on a login node.
+  - Run inside a Slurm job (`SLURM_JOB_ID` is set), they run directly.
+- **Cheap commands** (`usage`, `du`, `report`, `changes`, `jobs`, `tasks` and the config commands) always run in the foreground.
+
+### 14.2 Task generation
+
+- Task settings come from `[slurm]`, and each command can override them (`--time`, `--cpus`, `--mem`, `--partition`, `--account`).
+- The generated script is saved to `tasks/<id>/task.sh` so the user can inspect it. Logs are kept next to it.
+- Tasks request `--signal=B:USR1@300`. On that signal the task saves a checkpoint and exits cleanly. With `auto_resubmit` set, stomp resubmits the task to continue, up to a limit.
+- **Tasks attribute themselves (§15).** An archive or restore task logs itself to the grant whose data it handles. Scans are logged as `stomp` overhead.
+
+### 14.3 Task tracking
+
+`stomp tasks` lists submitted tasks with their state (from `squeue` and `sacct`) and progress (from the task's journal). `stomp tasks cancel <id>` cancels one.
+
+### 14.4 Recurring work
+
+`stomp schedule enable` sets up recurring runs:
+
+- It uses `scrontab` if the site enables it (Slurm 20.11 or later).
+- Otherwise it falls back to a task that resubmits itself with `--begin`.
+- **Default schedule:**
+  - **daily:** a usage sample and an accounting sync (`stomp jobs sync`); seconds of work.
+  - **weekly:** an incremental scan, followed by policy evaluation and checks on thawing restores.
+
+`stomp schedule status` and `stomp schedule disable` manage it.
+
+## 15. Compute job attribution
+
+Goal: report each grant's compute use next to its storage use. The center doesn't attribute jobs to grants, so stomp does it on the user's side.
+
+### 15.1 How a job gets its grant
+
+These sources are used in order of precedence:
+
+1. **Explicit log:** `stomp jobs log <GRANT>`, run inside the job script or afterwards with `--job`.
+2. **Working directory** (`compute.infer_from_workdir`, on by default): if the job's working directory, as recorded by `sacct`, is inside a grant directory, the job belongs to that grant.
+3. **Otherwise the job is unassigned.**
+
+Reports show which source attributed each job. Moving a directory to a different grant re-attributes the jobs inferred from it (§8.2); explicit logs never change.
+
+#### Logging from inside a job
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=run42
+#SBATCH --time=04:00:00
+stomp jobs log GRANT-A --note "calibration sweep"
+srun ./model ...
+```
+
+- **What it records:** the job ID from `SLURM_JOB_ID`, plus the grant, a timestamp, the hostname and an optional `--note`.
+- **Job arrays:** the record is keyed by `SLURM_ARRAY_JOB_ID`, so the whole array is logged once. Later tasks in the array see that the record exists and do nothing.
+- **Fast and lock-free.** It creates one small file, `inbox/jobs/<job-id>.json`, by writing to a temporary name and renaming it. It doesn't open the catalog or take any locks, and it returns within milliseconds.
+- **Never breaks the job.**
+  - It always exits 0 and reports problems as warnings on stderr. `--strict` turns warnings into errors for users who want that.
+  - An unknown grant ID is still recorded, with a warning. Reports show it as *unknown grant "X"* so a typo is visible and can be fixed with `stomp jobs retag`.
+  - If the config can't be read, the record is still written.
+
+#### Logging after the fact
+
+| Command | Effect |
+|---------|--------|
+| `stomp jobs log GRANT-A --job 123456 [--job 123457 ...]` | Tag finished jobs |
+| `stomp jobs log GRANT-A --name 'carbon_*' --since 2026-01-01` | Tag past jobs whose names match, found through `sacct`; useful for filling in history |
+| `stomp jobs retag <job-id>... <GRANT>` / `stomp jobs untag <job-id>...` | Fix mistakes |
+
+### 15.2 Collecting accounting data
+
+- **`stomp jobs sync`** imports the user's finished jobs from `sacct`. It runs automatically before compute reports and in the daily scheduled task. It asks for these fields, one line per job allocation, without job steps (`-X -P`):
+  - `JobID`, `JobName`, `State`, `Submit`, `Start`, `End`
+  - `ElapsedRaw`, `CPUTimeRAW`, `AllocTRES`
+  - `WorkDir`, `Partition`, `Account`
+- **Bounded queries.** Queries cover bounded time windows (one month at a time when filling in history), to keep load off the accounting database. The first sync goes back to `compute.history_start`.
+- **Records are copied into the catalog** (`compute_jobs`) because sites eventually purge old accounting records. Once copied, reports don't depend on `sacct` keeping them.
+- **Running jobs** are shown as in progress and recorded when they finish.
+
+### 15.3 Metrics
+
+Per grant and per period:
+
+| Metric | Derived from |
+|--------|--------------|
+| Jobs, by final state | `State` |
+| CPU hours | `CPUTimeRAW / 3600` (allocated CPUs × elapsed time) |
+| GPU hours | GPU count in `AllocTRES` (`gres/gpu=N`) × `ElapsedRaw / 3600` |
+| Billing units, if the site records them | `billing=` in `AllocTRES` × elapsed time |
+| Wall hours | `ElapsedRaw / 3600` |
+
+- **Cost estimates** appear if `rate_per_cpu_hour` or `rate_per_gpu_hour` is set.
+- **Failed and cancelled jobs** used allocation too, so they are counted, but reports also show them broken out by state.
+
+### 15.4 Example
+
+```
+$ stomp report compute --from 2026-10-01 --to 2026-10-31
+Compute by grant, 2026-10-01 to 2026-10-31  (sacct, synced 2026-11-16 15:02)
+
+GRANT          JOBS   CPU-HOURS   GPU-HOURS   ATTRIBUTED BY
+GRANT-A         412      18,340        612    log 380, workdir 32
+GRANT-B          37       2,105          0    workdir 37
+stomp             9          41          0    task 9
+(unassigned)     58         940         12    —
+TOTAL           516      21,426        624
+```
+
+## 16. Policies (automatic compression)
+
+- **Rules.** Policies are written in the config (§7.2). The available conditions are:
+  - `grant`, `path` (glob)
+  - `grant_ended_for`, `unchanged_for`
+  - `min_bytes`, `min_files`, `max_avg_file_size`
+- **Evaluation.** Policies are evaluated after each scan. On Ceph they can also run between scans, using the live directory totals. The results are stored as **proposals**.
+- **Reviewing proposals.** `stomp candidates` lists proposals with the estimated space saved and reduction in file count. `stomp apply <proposal-id> | --all` carries them out.
+- **Defaults are safe.** The default action is `propose`, so nothing destructive happens automatically unless the user writes `action = "apply"` in a policy. When they do, stomp submits an archive task after the scan, and all the invariants in §12.4 still apply.
+
+## 17. Command-line interface
+
+**Global flags:** `--config <path>`, `--json`, `--dry-run`, `-v`/`-q`.
+
+| Command | Purpose | Runs |
+|---------|---------|------|
+| `stomp init` | Create a config from the detected layout | foreground |
+| `stomp doctor [--submit]` | Check the environment: backend, quota, Slurm, `sacct`, scrontab, each destination (login, verification method, credential expiry), catalog size. `--submit` repeats the destination checks from a compute node. | foreground / task |
+| `stomp usage [--grant G] [--root R]` | Current storage use by grant (§8.4) | foreground |
+| `stomp du [PATH] [--depth N]` | Directory tree with sizes; instant on Ceph | foreground |
+| `stomp scan [--full] [--resume] [--here]` | Detailed scan | task |
+| `stomp changes [--since T] [--grant G] [--depth N] [--files]` | Storage change tracking (§11) | foreground |
+| `stomp report <kind> [--from --to] [--format F] [-o FILE]` | Reports (§18) | foreground |
+| `stomp find [--grant G] [--largest N] [--older-than T] [--ext E]` | Find files and directories, using scan data | foreground |
+| `stomp candidates` / `stomp apply` | Review and carry out proposals (§16) | foreground / task |
+| `stomp archive <DIR> [--to local\|<dest>] [--estimate] [--yes]` | Archive a directory | task |
+| `stomp archives list\|show\|verify\|move\|push` | Manage existing archives | mixed |
+| `stomp restore <ID\|PATH> [--only G] [--to DIR] [--resume]` | Restore (§12.5) | task |
+| `stomp jobs log <GRANT> [--job ID]... [--name GLOB --since T] [--note TEXT] [--strict]` | Attribute compute jobs to a grant (§15.1) | instant |
+| `stomp jobs list [--grant G] [--since T] [--unassigned]` | Compute jobs with their grant and usage | foreground |
+| `stomp jobs sync` / `retag` / `untag` | Import accounting records; fix attributions | foreground |
+| `stomp tasks [list\|show\|cancel]` | stomp's own background work (§14.3) | foreground |
+| `stomp schedule enable\|disable\|status` | Recurring work (§14.4) | foreground |
+| `stomp ingest` | Import the inbox (normally automatic) | foreground |
+| `stomp tui` | Interactive browser (later phase, §19) | foreground |
+
+**Exit codes:**
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Error |
+| 2 | Invalid usage or config |
+| 3 | Partial success; details in the output |
+
+The one exception is `stomp jobs log`, which always exits 0 unless `--strict` is given (§15.1).
+
+## 18. Reports
+
+| Report | Contents |
+|--------|----------|
+| `usage` | Current per-grant storage, excluded directories and unassigned usage, quota, remote holdings by destination |
+| `compute` | Per-grant jobs, CPU hours, GPU hours and billing units for a period, with how each job was attributed (§15.4) |
+| `history` | Per-grant storage (TB-months) and compute over time; optional cost estimates |
+| `grant <id>` | One grant's storage and compute together: directories, usage over time, age profile, top extensions, largest files, archives by destination, CPU and GPU hours by month. Suitable for a progress report or data management plan. |
+| `lifecycle` | Grants past their end date that still have data on the HPC or jobs logged to them; remote holdings by grant |
+| `stale` | Largest directories that haven't been modified in a long time, per grant, with matching proposals |
+| `reclaimable` | Caches and other reclaimable space, with the commands that clean them |
+| `changes` | Same as `stomp changes`, formatted for sharing |
+
+- **Formats:** terminal table, CSV, Markdown, JSON, and HTML (one self-contained file with inline SVG charts and no external dependencies).
+- Every report states the measurement and sync times, the backend used and any caveats, such as possible lag in the Ceph totals.
+
+## 19. TUI (later phase)
+
+- An `ncdu`-style tree browser built with `ratatui` on the same core library as the CLI.
+- **On Ceph, sizes come live from the directory totals,** so browsing needs no scan.
+- **Display:** colored by grant; excluded directories and archived directories are marked.
+- **Actions:** assign a directory to a grant (edits the config), estimate, archive, restore and view the change history.
+- **A compute panel** shows recent jobs per grant.
+
+## 20. Implementation
+
+### 20.1 Structure
+
+Start as a single crate whose modules have clear boundaries. Split it into a workspace later if that becomes useful.
+
+| Module | Contents |
+|--------|----------|
+| `config` | Parsing, validation, path expansion |
+| `grants` | Storage attribution and usage samples |
+| `fs` | Backend interface, Ceph and POSIX backends, parallel walker |
+| `catalog` | SQLite schema, migrations, ingest, retention |
+| `scan` | Scanning, totals, excluded-directory detection, checkpoints |
+| `archive` | Chunk writer and reader, manifests, the per-chunk steps and journal, restore |
+| `dest` | Destination interface; `dest::sftp` (OpenSSH subprocesses) and `dest::s3` (AWS SDK, behind the `s3` feature) |
+| `compute` | `jobs log` records, `sacct` sync and parsing, attribution, metrics |
+| `slurm` | Task script generation, submission, tracking, signal handling, scheduling |
+| `policy` | Rule matching and proposals |
+| `report` | Renderers for each output format |
+| `cli` | `clap` command definitions and output |
+| `tui` | Later |
+
+### 20.2 Dependencies (planned)
+
+| Purpose | Crates |
+|---------|--------|
+| Command line and config | `clap`, `serde`, `toml` |
+| Catalog | `rusqlite` (bundled SQLite) |
+| Archives | `tar`, `zstd` (multithreaded), `blake3`, `sha2` |
+| Filesystem | `xattr`, `rustix` (statfs, statx), `rayon` or a custom work-stealing walker |
+| S3 (`s3` feature) | `aws-config`, `aws-sdk-s3` using rustls; the `tokio` runtime is used only inside `dest::s3`, and the rest of stomp stays synchronous |
+| Dates and durations | `jiff` |
+| Errors and logging | `thiserror`, `anyhow`, `tracing` |
+| Progress output | `indicatif` |
+| TUI (later) | `ratatui`, `crossterm` |
+
+### 20.3 Build and distribution
+
+- Built as a static binary for `x86_64-unknown-linux-musl`, so it doesn't depend on the cluster's glibc version. aarch64 can be added if needed.
+- Users copy one file into `~/bin`. A build without the `s3` feature is available for users who want a smaller binary.
+- **External programs are needed only for the features that use them:** OpenSSH `ssh`/`sftp` for SFTP destinations, and Slurm's `sbatch`, `squeue`, `sacct` and `scrontab` for tasks and compute attribution.
+
+## 21. Testing
+
+- **Unit tests:**
+  - storage attribution arithmetic
+  - config validation (overlap, nesting and destination rules)
+  - policy matching
+  - TB-month calculation
+  - retention
+  - compute attribution precedence and metric calculation
+- **Backends:**
+  - Ceph, through a fake attribute provider that can simulate stale totals
+  - POSIX, on temporary directories
+- **Archive round-trip property tests:**
+  - Generate random trees with non-UTF-8 names, newlines in names, very long paths, symlinks, hard links, empty and sparse files, and unreadable files.
+  - Archive each tree, restore it, and compare content and metadata.
+- **Crash and resume tests:** kill the process at every step of §12.4, then assert that invariants I1–I4 hold after resuming.
+- **Destinations:**
+  - **SFTP:** run against a local `sshd` in a container in two setups: shell allowed, and SFTP-only (`ForceCommand internal-sftp`).
+  - **S3:** run against MinIO in a container, covering resuming an interrupted multipart upload, rejection of a deliberately wrong checksum, and range downloads.
+  - **Cold storage:** test the thaw flow with a mocked S3 client.
+- **Compute:**
+  - Parse saved `sacct` output from several Slurm versions, including arrays, jobs with GPU TRES and still-running jobs.
+  - Check that `stomp jobs log` exits 0 when there is no config, when the inbox can't be written, when it runs outside a job, and when the grant is unknown.
+- **Manual acceptance on the cluster:**
+  - `doctor` and `doctor --submit`
+  - `usage` matches `getfattr`
+  - an incremental scan after a known change
+  - an archive and restore of a test directory
+  - an SFTP round trip and a DigitalOcean Spaces round trip
+  - a job logged with `stomp jobs log` appearing in `report compute`
+
+## 22. Roadmap
+
+| Milestone | Contents | Value |
+|-----------|----------|-------|
+| **M1 Usage** | config, `init`, `doctor`, storage attribution, `usage`, `du`, usage samples, basic CSV and table report, **`stomp jobs log`** (writes records to the inbox only) | Per-grant storage numbers immediately; job tags start accumulating |
+| **M2 Scan and compute** | walker, excluded directories, catalog and ingest, incremental scans, task submission, `tasks`, `changes`, **`jobs sync`, working-directory inference, `report compute`**, full reports | History, change tracking, finding stale data, compute per grant |
+| **M3 Local archive** | chunk format, manifests, the per-chunk steps and journal, invariants, `--estimate`, local restore | Compression in place |
+| **M4 Remote destinations** | destination interface, SFTP, S3 (standard storage classes), verification methods, partial restore, `archives move` and `archives push`, remote reports | Moving data off the HPC |
+| **M5 Automation** | policies, `candidates` and `apply`, `schedule` | Hands-off upkeep |
+| **M6 Cold storage** (deferred) | S3 Glacier and Deep Archive: thaw requests, two-phase restores, cost estimates | Cheap long-term archives |
+| **M7 TUI** | Interactive browser | Convenience |
+
+## 23. Decisions
+
+| ID | Decision | Rationale |
+|----|----------|-----------|
+| D1 | Runs only as the user, with no background service | Not an admin tool; colleagues must be able to adopt it alone |
+| D2 | Grants are mapped by **directory**, and directories never overlap | Matches how the data is actually organized; on Ceph it makes attribution exact and instant |
+| D3 | Ceph backend that reads directory totals, with a POSIX fallback | Instant usage and incremental scans on the target cluster, while still working elsewhere |
+| D4 | The catalog stores per-directory totals, not per-file rows (per-file tracking is opt-in) | Keeps the catalog inside the user's quota with tens of millions of files |
+| D5 | SQLite with a single writer, plus an inbox for task results and job logs | Safe on a network filesystem; tasks, job scripts and the CLI never conflict |
+| D6 | SFTP through OpenSSH subprocesses rather than an embedded SSH library | Reuses the user's existing SSH setup; nothing cryptographic in our binary |
+| D7 | Chunked `.tar.zst` archives with the same layout everywhere, restorable with standard tools | Partial restores, bounded extra space, no lock-in |
+| D8 | Policies propose by default | Nothing destructive happens unless the user explicitly asks for it |
+| D9 | Heavy commands submit Slurm tasks by default | Keeps load off login nodes |
+| D10 | Files owned by other users are skipped by default | Never delete a collaborator's files in a shared directory |
+| D11 | Environments and caches are counted in usage but never scanned or archived | Sandboxes hold millions of files that can be rebuilt; caches can be cleaned instead |
+| D12 | Destinations are a named list of pluggable types (`sftp`, `s3`) | One archive format and one restore path; users can keep several destinations |
+| D13 | S3 through the embedded AWS SDK, behind a feature that is on by default | Reads existing AWS config and credentials natively; supports checksums, resumable multipart uploads and thaw requests; no extra programs |
+| D14 | Compute jobs are attributed by explicit log first, then by working directory | Most jobs are attributed with no effort, explicit logging overrides it, and history can be filled in from `sacct` |
+| D15 | `stomp jobs log` never fails the user's job | A tracking tool must never cost someone a compute run |
+| D16 | Accounting records are copied into the catalog | Sites purge old `sacct` records |
+| D17 | stomp's own Slurm work is called **tasks**; **jobs** means the user's compute jobs | Avoids an ambiguous `stomp jobs` command |
+
+## 24. Open questions
+
+- **Q1. NAS access:** can we run commands on the NAS over SSH, or is it SFTP-only?
+  - This sets the default for `verify` on the NAS destination. Shell access allows `remote-sha256`; SFTP-only means `readback`.
+  - Also needed: the NAS hostname and base path, whether the NAS has a quota, and whether the NAS is itself backed up. After archiving, the NAS copy is the only copy.
+- **Q2. "File management" scope:** this draft covers `du`, `find`, reclaimable caches and moving directories between grants (by editing the config). Are deleting, moving or deduplicating files also wanted?
+- **Q3. CPU architecture:** the cluster's `uname -m` output. x86_64 is assumed.
+- **Q5. Accounting fields:** does the site record GPUs and billing units in `AllocTRES`? Check with `sacct -X -S now-7days -o JobID,AllocTRES%80 | head`.
+
+### Resolved
+
+- **Q4. S3 provider:** DigitalOcean Spaces (§13.3.7). Its keys are long-lived, so credential expiry isn't a concern. Glacier is wanted for long-term storage eventually but is deferred (M6, §13.3.5). Whether compute nodes can reach Spaces is still to be checked with `stomp doctor --submit`.
+
+### Deferred
+
+- **Q6. Splitting a job across grants:** a good idea, but not needed so far (§25).
+
+## 25. Future ideas
+
+- Offer to convert Apptainer sandboxes to SIF images (`apptainer build x.sif sandbox/`). One file replaces millions, which saves both space and load on the metadata server.
+- Duplicate detection within and across grants.
+- Shared grant definitions for collaborators, so a lab or group can see combined storage and compute per grant across users.
+- Grant mappings with effective dates, so that remapping a directory doesn't rewrite its history.
+- Report delivery by email or chat.
+- An Open OnDemand app built on the same core.
+- More transports: Globus, or `rclone`, which would add Google Drive, OneDrive and Box.
+- Attribution without stomp in job scripts: `#SBATCH --comment=stomp:GRANT-A`, read back through `sacct`. This works only if the site stores job comments (`AccountingStoreFlags=job_comment`).
+- A seekable zstd format, so a single file can be restored from S3 with a byte-range download instead of fetching the whole chunk.
+- Splitting one job across grants (`stomp jobs log GRANT-A=0.5 GRANT-B=0.5`). Deferred from Q6 until there's a real need.
