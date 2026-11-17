@@ -116,8 +116,119 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Table)]
         format: Format,
     },
-    /// Import finished scans and job logs now (normally automatic)
+    /// Pack a directory into compressed, verified chunks and remove the originals
+    ///
+    /// Originals are removed one chunk at a time, only after the chunk has been
+    /// read back and every file's checksum compared, and only if they haven't
+    /// changed since. Runs as a Slurm task unless --here; asks first unless --yes.
+    Archive {
+        /// The directory to archive
+        dir: PathBuf,
+        /// Where to keep the archive: local (in the directory itself)
+        #[arg(long, value_name = "DEST")]
+        to: Option<String>,
+        /// Don't ask for confirmation
+        #[arg(long, short)]
+        yes: bool,
+        /// Show the plan without archiving anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Show the plan and estimate the compressed size, without archiving anything
+        #[arg(long)]
+        estimate: bool,
+        /// Run here instead of submitting a Slurm task
+        #[arg(long)]
+        here: bool,
+        /// Continue an archive that stopped partway
+        #[arg(long)]
+        resume: bool,
+        /// zstd compression level, 1–22 [default: archive.zstd_level, 3]
+        #[arg(long, value_name = "N")]
+        level: Option<i32>,
+        /// Largest chunk, e.g. 50GiB [default: archive.chunk_size]
+        #[arg(long, value_name = "SIZE")]
+        chunk_size: Option<String>,
+        /// The archive this run continues (set in scripts stomp generates)
+        #[arg(long, hide = true)]
+        id: Option<String>,
+        #[arg(long, hide = true)]
+        task: Option<String>,
+        #[command(flatten)]
+        slurm: SlurmArgs,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// List, inspect and verify archives
+    Archives {
+        #[command(subcommand)]
+        action: Option<ArchivesCommand>,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// Put archived files back
+    ///
+    /// Restores into the original directory unless --to is given, never
+    /// replacing existing files unless --overwrite. After a complete restore
+    /// of everything, the archive is removed (unless --keep-archive).
+    Restore {
+        /// Archive ID, or the archived directory
+        archive: String,
+        /// Only paths matching this pattern, relative to the archived directory (repeatable)
+        #[arg(long, value_name = "PATTERN")]
+        only: Vec<String>,
+        /// Restore into this directory instead
+        #[arg(long, value_name = "DIR")]
+        to: Option<PathBuf>,
+        /// Replace files that already exist
+        #[arg(long)]
+        overwrite: bool,
+        /// Keep the archive even after restoring everything
+        #[arg(long)]
+        keep_archive: bool,
+        /// Don't ask for confirmation
+        #[arg(long, short)]
+        yes: bool,
+        /// Run here instead of submitting a Slurm task
+        #[arg(long)]
+        here: bool,
+        #[arg(long, hide = true)]
+        task: Option<String>,
+        #[command(flatten)]
+        slurm: SlurmArgs,
+    },
+    /// Import finished scans, job logs and archive records now (normally automatic)
     Ingest,
+}
+
+#[derive(Subcommand)]
+enum ArchivesCommand {
+    /// List archives (the default)
+    List,
+    /// Details of one archive
+    Show {
+        /// Archive ID, or the archived directory
+        archive: String,
+    },
+    /// Check an archive's checksums
+    Verify {
+        /// Archive ID, or the archived directory
+        archive: String,
+        /// Also decompress every chunk and check each file's checksum
+        #[arg(long)]
+        deep: bool,
+    },
+}
+
+impl SlurmArgs {
+    fn overrides(self) -> Overrides {
+        Overrides {
+            time: self.time,
+            cpus: self.cpus,
+            mem: self.mem,
+            partition: self.partition,
+            account: self.account,
+        }
+    }
 }
 
 /// Overrides for the [slurm] settings of a submitted task.
@@ -424,13 +535,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 resume,
                 here,
                 task,
-                overrides: Overrides {
-                    time: slurm.time,
-                    cpus: slurm.cpus,
-                    mem: slurm.mem,
-                    partition: slurm.partition,
-                    account: slurm.account,
-                },
+                overrides: slurm.overrides(),
             };
             return cmd::scan::run(&cfg, &config_path, &data_dir, args);
         }
@@ -499,13 +604,80 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Some(TasksCommand::Show { id }) => cmd::tasks::show(&data_dir, &id)?,
             Some(TasksCommand::Cancel { id }) => cmd::tasks::cancel(&data_dir, &id)?,
         },
+        Command::Archive {
+            dir,
+            to,
+            yes,
+            dry_run,
+            estimate,
+            here,
+            resume,
+            level,
+            chunk_size,
+            id,
+            task,
+            slurm,
+            format: f,
+        } => {
+            let cfg = load_config(&config_path)?;
+            start_threads(Some(&cfg));
+            let args = cmd::archive::ArchiveArgs {
+                dir,
+                to,
+                yes,
+                dry_run,
+                estimate,
+                here,
+                resume,
+                level,
+                chunk_size,
+                id,
+                task,
+                overrides: slurm.overrides(),
+                format: format(f),
+            };
+            return cmd::archive::archive(&cfg, &config_path, &data_dir, args);
+        }
+        Command::Archives { action, format: f } => match action {
+            None | Some(ArchivesCommand::List) => cmd::archive::list(&data_dir, format(f))?,
+            Some(ArchivesCommand::Show { archive }) => cmd::archive::show(&data_dir, &archive)?,
+            Some(ArchivesCommand::Verify { archive, deep }) => {
+                return cmd::archive::verify(&data_dir, &archive, deep);
+            }
+        },
+        Command::Restore {
+            archive,
+            only,
+            to,
+            overwrite,
+            keep_archive,
+            yes,
+            here,
+            task,
+            slurm,
+        } => {
+            let cfg = load_config(&config_path)?;
+            let args = cmd::archive::RestoreArgs {
+                what: archive,
+                only,
+                to,
+                overwrite,
+                keep_archive,
+                yes,
+                here,
+                task,
+                overrides: slurm.overrides(),
+            };
+            return cmd::archive::restore(&cfg, &config_path, &data_dir, args);
+        }
         Command::Ingest => {
             let catalog = cmd::open_catalog(&data_dir)?;
             println!(
-                "The catalog has {} measurement(s), {} scan(s) and {} job record(s).",
+                "The catalog has {} measurement(s), {} scan(s), {} job record(s) and {} archive(s).",
                 catalog.measurement_count()?,
                 catalog.scan_count()?,
-                catalog.job_count()?
+                catalog.job_count()?,
+                catalog.archives()?.len()
             );
         }
     }

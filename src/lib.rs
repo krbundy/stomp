@@ -2,6 +2,7 @@
 //!
 //! The design lives in `spec/design.md`; module boundaries follow §20.1 of it.
 
+pub mod archive;
 pub mod attribution;
 pub mod catalog;
 pub mod cli;

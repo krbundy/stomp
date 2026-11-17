@@ -92,7 +92,6 @@ struct RawScan {
 struct RawArchive {
     chunk_size: Option<String>,
     zstd_level: Option<i32>,
-    #[allow(dead_code)] // used from milestone M3
     only_owned: Option<bool>,
     default_destination: Option<String>,
 }
@@ -210,6 +209,7 @@ pub struct Config {
     pub slurm: SlurmConfig,
     pub scan: ScanConfig,
     pub compute: ComputeConfig,
+    pub archive: ArchiveConfig,
     pub rates: Rates,
     /// Where archive chunks are built; `None` means inside the archived directory.
     pub staging_dir: Option<PathBuf>,
@@ -233,6 +233,17 @@ pub struct ScanConfig {
 pub struct ComputeConfig {
     pub infer_from_workdir: bool,
     pub history_start: Option<jiff::civil::Date>,
+}
+
+/// Archive settings (§12).
+#[derive(Debug, Clone)]
+pub struct ArchiveConfig {
+    pub chunk_size: u64,
+    pub zstd_level: i32,
+    /// Leave files owned by other users in place (D10).
+    pub only_owned: bool,
+    /// `local` or a destination name.
+    pub default_destination: String,
 }
 
 /// Optional rates for cost estimates in reports.
@@ -453,6 +464,21 @@ impl Validator {
                     .history_start
                     .as_ref()
                     .and_then(|d| to_date(d).ok()),
+            },
+            archive: ArchiveConfig {
+                chunk_size: raw
+                    .archive
+                    .chunk_size
+                    .as_deref()
+                    .and_then(|v| units::parse_size(v).ok())
+                    .unwrap_or(50 << 30),
+                zstd_level: raw.archive.zstd_level.unwrap_or(3),
+                only_owned: raw.archive.only_owned.unwrap_or(true),
+                default_destination: raw
+                    .archive
+                    .default_destination
+                    .clone()
+                    .unwrap_or_else(|| LOCAL_DESTINATION.to_string()),
             },
             rates: Rates {
                 per_tb_month: raw.general.rate_per_tb_month,
@@ -764,6 +790,11 @@ impl Validator {
             {
                 self.error(format!("{field}: {e:#}"));
             }
+        }
+        if let Some(size) = &raw.archive.chunk_size
+            && units::parse_size(size).is_ok_and(|s| s < 1 << 20)
+        {
+            self.error("archive.chunk_size must be at least 1 MiB");
         }
         if let Some(level) = raw.archive.zstd_level
             && !(1..=22).contains(&level)

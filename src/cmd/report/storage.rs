@@ -59,6 +59,8 @@ pub fn stale(
             && r.excluded.is_none()
             && r.agg.files > 0
             && r.agg.newest_mtime.is_some_and(|m| m < cutoff)
+            // Archives are old by design; they're already dealt with.
+            && !r.path.components().any(|c| c.as_os_str() == crate::archive::ARCHIVE_DIR)
     };
     // Report only the topmost stale directories: everything inside a stale
     // directory is stale too. Checking the nearest recorded ancestor is

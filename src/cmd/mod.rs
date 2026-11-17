@@ -1,19 +1,22 @@
 //! Command implementations. Each module renders its own output.
 
+pub mod archive;
 pub mod changes;
 pub mod doctor;
 pub mod du;
 pub mod init;
 pub mod jobs;
+pub mod progress;
 pub mod report;
 pub mod scan;
 pub mod tasks;
 pub mod usage;
 
 use std::fmt::Display;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -76,6 +79,22 @@ pub(crate) fn rfc3339(seconds: Option<i64>) -> String {
 
 pub(crate) fn warn(message: impl Display) {
     eprintln!("stomp: warning: {message}");
+}
+
+/// Asks a yes/no question on the terminal (§12.4, I5). Without a terminal,
+/// destructive commands need `--yes` instead.
+pub(crate) fn confirm(question: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        bail!("this needs confirmation; run it again with --yes");
+    }
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Opens the catalog and imports anything waiting in the inbox (§10.2).

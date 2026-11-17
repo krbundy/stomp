@@ -1,9 +1,16 @@
 # stomp: Design Specification
 
-**Status:** Draft v0.4 (2026-11-17). Milestones M1 and M2 are implemented.
+**Status:** Draft v0.5 (2026-11-17). Milestones M1, M2 and M3 are implemented.
 **Scope:** Behavior and architecture for the first releases. Open questions are listed in §24.
 
-**Changes since v0.3** (decisions made while building M2):
+**Changes since v0.4** (decisions made while building M3, local archiving):
+- §12.6 records how archiving was built: what's refused, the fixed plan, verification, deletion and restore details.
+- **The plan is fixed when archiving starts**, so files created afterwards stay in place (D21).
+- **Deletion is two-phase**, and hard links are checked without ctime (D22).
+- **Each chunk is fully decompressed and checked before any deletion** (D23).
+- **Restores are resumable:** files that already match are counted as restored (D24).
+
+**Changes in v0.4** (decisions made while building M2):
 - **Ages are stored as months, not age bands.** Each directory keeps a histogram of files and bytes per modification month; reports turn it into age bands at report time (§9.3, D18).
 - **File types and largest files** are recorded only by full scans that weren't interrupted (§9.3).
 - **Interrupted scans resume by work unit**: the directories two levels below each root (§9.2).
@@ -537,6 +544,65 @@ PLAN → WRITE → VERIFY_LOCAL → [remote: UPLOAD → VERIFY_REMOTE → DELETE
   - the remote copy is kept unless `--delete-remote` is given.
 - If the chunks are in a cold S3 storage class, the restore runs in two phases (§13.3.5).
 
+### 12.6 As built (M3: local archives)
+
+#### What stomp refuses to archive
+
+`stomp archive` refuses:
+- a root itself
+- a directory containing another grant's directories (archive each grant's directories separately)
+- anything inside a `.stomp-archive`
+- an environment, cache or excluded directory
+- a directory containing stomp's own data
+- a directory that already has a `STOMP_ARCHIVED.txt`, unless resuming
+
+#### Planning
+
+A parallel walk lists the entries, sorted by name within each directory, and assigns them to chunks.
+- **The plan is saved in the archive directory and fixed for the rest of the archive.** Files created later aren't in it, so they stay where they are (D21).
+- **Planning holds the whole list in memory, about 150 bytes per file.** That's roughly 1.5 GB per 10 million files. Size `--mem` for archive tasks accordingly.
+
+#### The note
+
+The note is written as soon as planning finishes ("being archived…", with how to resume or restore), so a half-finished directory always explains itself. It is rewritten when the archive finishes.
+
+#### For each chunk
+
+1. **WRITE:** written to `chunk-NNNN.tar.zst.partial`, synced, then renamed into place. Per-file records (BLAKE3 hash, inode, size, mtime and ctime to the nanosecond) go to `manifest.d/chunk-NNNN.jsonl`.
+   - A file is opened without following symlinks.
+   - A file that shrank, grew or changed while being read is still recorded, but marked `changed`. It is never deleted.
+2. **VERIFY:** the chunk's SHA-256 is checked, then it is fully decompressed and every file's BLAKE3 hash compared (D23).
+   - On a mismatch, the chunk is deleted and a `discarded` event is journaled. Nothing from it is deleted, and the next run writes it again.
+3. **DELETE:** first every original in the chunk is checked, then the unchanged ones are removed (D22).
+   - **Regular files and symlinks** must match their recorded inode, size, mtime and ctime.
+   - **Hard links** are checked by inode, size and mtime. Removing one link changes the shared inode's ctime, so ctime can't be used.
+   - **Kept files:** originals that changed or couldn't be removed are listed in `chunk-NNNN.kept.jsonl` and marked `kept` in the final manifest.
+
+#### Finishing
+
+After all chunks, directories that are now empty are removed, deepest first. stomp then writes the final manifest (header, entries, then what was left in place), `SHA256SUMS`, `README.txt` and the final note, and removes its working files (`plan/`, `manifest.d/`).
+
+#### Resuming
+
+The journal is replayed on every run, and an interrupted step is redone:
+- a half-written chunk is rewritten
+- an unverified chunk is verified
+- an interrupted deletion is repeated; it's idempotent, since it only removes originals that still match their record
+
+Tests stop the run after every journaled step in turn, resume it, restore, and compare every file, mode, mtime, symlink and hard link with the original.
+
+#### Restore
+
+- **Resumable:** a file whose size and mtime already match counts as restored (D24).
+- **Kept originals are left alone:** files the archive marked `kept` are newer than the archived copies.
+- **When the archive is removed:** only after a complete restore of everything into the original location, with no conflicts.
+
+#### Other commands
+
+- `stomp archives list` lists archives from the catalog.
+- `stomp archives show <ID|DIR>` summarizes one archive.
+- `stomp archives verify <ID|DIR> [--deep]` checks the checksums; `--deep` also decompresses every chunk and checks every file.
+
 ## 13. Remote destinations
 
 ### 13.1 Common interface
@@ -784,9 +850,9 @@ TOTAL           516      21,426        624
 | `stomp report <kind> [options] [--format table\|csv\|json\|md]` | Reports (§18) | foreground |
 | `stomp find [--grant G] [--largest N] [--older-than T] [--ext E]` | Find files and directories, using scan data | foreground |
 | `stomp candidates` / `stomp apply` | Review and carry out proposals (§16) | foreground / task |
-| `stomp archive <DIR> [--to local\|<dest>] [--estimate] [--yes]` | Archive a directory | task |
-| `stomp archives list\|show\|verify\|move\|push` | Manage existing archives | mixed |
-| `stomp restore <ID\|PATH> [--only G] [--to DIR] [--resume]` | Restore (§12.5) | task |
+| `stomp archive <DIR> [--to local\|<dest>] [--dry-run] [--estimate] [--resume] [--level N] [--chunk-size S] [--yes] [--here]` | Archive a directory; `--dry-run` and `--estimate` only plan | task |
+| `stomp archives list\|show\|verify [--deep]\|move\|push` | Manage existing archives (`move` and `push` arrive with M4) | mixed |
+| `stomp restore <ID\|DIR> [--only PATTERN]... [--to DIR] [--overwrite] [--keep-archive] [--yes] [--here]` | Restore (§12.5); resumable by running it again | task |
 | `stomp jobs log <GRANT> [--job ID]... [--name GLOB --since T] [--note TEXT] [--strict]` | Attribute compute jobs to a grant (§15.1) | instant |
 | `stomp jobs list [--grant G \| --unassigned] [--since T] [--no-sync]` | Compute jobs with their grant and usage | foreground |
 | `stomp jobs sync` | Import accounting records now; other commands do it when the last import is over 15 minutes old | foreground |
@@ -912,7 +978,7 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 |-----------|----------|-------|
 | **M1 Usage** ✅ | config, `init`, `doctor`, storage attribution, `usage`, `du`, usage samples, basic CSV and table report, **`stomp jobs log`** (writes records to the inbox only) | Per-grant storage numbers immediately; job tags start accumulating |
 | **M2 Scan and compute** ✅ | walker, excluded directories, catalog and ingest, incremental scans, task submission, `tasks`, `changes`, **`jobs sync`, working-directory inference, `report compute`**, reports (`grant`, `stale`, `reclaimable`, `lifecycle`, `history` with TB-months). Deferred from M2: HTML reports, `track_files`, `jobs log --name`. | History, change tracking, finding stale data, compute per grant |
-| **M3 Local archive** | chunk format, manifests, the per-chunk steps and journal, invariants, `--estimate`, local restore | Compression in place |
+| **M3 Local archive** ✅ | chunk format, manifests, the per-chunk steps and journal, invariants, `--estimate`, local restore, `archives list/show/verify` | Compression in place |
 | **M4 Remote destinations** | destination interface, SFTP, S3 (standard storage classes), verification methods, partial restore, `archives move` and `archives push`, remote reports | Moving data off the HPC |
 | **M5 Automation** | policies, `candidates` and `apply`, `schedule` | Hands-off upkeep |
 | **M6 Cold storage** (deferred) | S3 Glacier and Deep Archive: thaw requests, two-phase restores, cost estimates | Cheap long-term archives |
@@ -942,6 +1008,10 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | D18 | Scans store a histogram per modification month, not relative age bands | Reused subtrees stay correct as their files age; age bands are computed at report time |
 | D19 | The scan result file commits each unit without syncing to disk | About 20 times faster, and it avoids metadata-server round trips on CephFS; a killed process loses nothing, and an OS crash only means redoing a few units |
 | D20 | `stomp changes` compares grant totals by default; `--dirs` compares scans | The per-grant view is instant on Ceph and needs no scan; the directory view needs two scans |
+| D21 | An archive's plan is fixed at the start and saved with it | Resuming is deterministic; files created during archiving simply stay in place |
+| D22 | Deletion checks every original in a chunk before removing any; hard links are checked without ctime | Removing one hard link changes the shared inode's ctime, which would otherwise make the other links look modified |
+| D23 | Before deleting originals, each chunk is fully decompressed and every file's BLAKE3 compared | Verifying the chunk's SHA-256 alone would only prove the chunk wasn't damaged after writing, not that it holds the right data |
+| D24 | A restore treats files whose size and mtime match as already restored | An interrupted restore can be rerun without reporting its own work as conflicts |
 
 ## 24. Open questions
 

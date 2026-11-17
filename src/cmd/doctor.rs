@@ -10,7 +10,7 @@ use crate::catalog::Catalog;
 use crate::config::{Config, Destination};
 use crate::fs as sfs;
 use crate::units::{format_bytes, format_count};
-use crate::{cmd, compute, jobs, paths, scan, sys, tasks};
+use crate::{archive, cmd, compute, jobs, paths, scan, sys, tasks};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -131,18 +131,30 @@ fn check_state(r: &mut Report, data_dir: &Path) {
         }
         Err(e) => r.line(Status::Fail, "catalog", format!("{e:#}")),
     }
-    let waiting = fs::read_dir(jobs::inbox_dir(data_dir)).map_or(0, |entries| {
-        entries
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-            .count()
-    });
-    if waiting > 0 {
-        r.line(
-            Status::Info,
-            "job logs",
-            format!("{waiting} job record(s) waiting to be imported"),
-        );
+    let waiting = |dir: &Path| {
+        fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        })
+    };
+    for (topic, dir, what) in [
+        ("job logs", jobs::inbox_dir(data_dir), "job record(s)"),
+        (
+            "archives",
+            archive::inbox_dir(data_dir),
+            "archive record(s)",
+        ),
+    ] {
+        let n = waiting(&dir);
+        if n > 0 {
+            r.line(
+                Status::Info,
+                topic,
+                format!("{n} {what} waiting to be imported; any other command imports them"),
+            );
+        }
     }
     if let Ok(results) = scan::list_results(&scan::inbox_dir(data_dir)) {
         let (done, interrupted): (Vec<_>, Vec<_>) =
@@ -172,6 +184,21 @@ fn check_state(r: &mut Report, data_dir: &Path) {
                 Status::Info,
                 "tasks",
                 format!("{active} task(s) submitted or running; see `stomp tasks`"),
+            );
+        }
+    }
+    if let Ok(catalog) = Catalog::open(data_dir)
+        && let Ok(archives) = catalog.archives()
+    {
+        for a in archives.iter().filter(|a| a.state == "in-progress") {
+            r.line(
+                Status::Warn,
+                "archives",
+                format!(
+                    "archiving {} ({}) hasn't finished; `stomp archive --resume` continues it",
+                    paths::display(Path::new(&a.source)),
+                    a.id
+                ),
             );
         }
     }

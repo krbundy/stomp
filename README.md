@@ -4,8 +4,8 @@ A storage management utility for HPC users. stomp runs as you, with no root or
 admin help, and attributes your storage and Slurm jobs to the research grants
 that pay for them.
 
-The full design is in [`spec/design.md`](spec/design.md). Milestones M1 and M2
-are done:
+The full design is in [`spec/design.md`](spec/design.md). Milestones M1, M2
+and M3 are done:
 
 | Command | What it does |
 |---------|--------------|
@@ -24,6 +24,9 @@ are done:
 | `stomp report stale` | Big directories nothing has touched in 180 days |
 | `stomp report reclaimable` | Caches and environments, with commands to slim them down |
 | `stomp report lifecycle` | Grants that have ended or are about to, and what they still use |
+| `stomp archive DIR` | Packs a directory into compressed, verified chunks and removes the originals |
+| `stomp archives` | Lists archives; `show` and `verify [--deep]` |
+| `stomp restore ID` | Puts archived files back, all of them or `--only` some |
 
 Data commands accept `--format table|csv|json|md`.
 
@@ -40,6 +43,26 @@ scan runs every 30 days (`scan.full_every`), or on request with `--full`.
 Software environments (Apptainer sandboxes, conda environments, Python venvs),
 known caches, and anything matching `scan.exclude` are counted toward their
 grant but not scanned.
+
+### Archives
+
+```sh
+stomp archive ~/project/runs_2023 --estimate   # the plan and expected size; changes nothing
+stomp archive ~/project/runs_2023              # asks, then submits a Slurm task
+stomp archives                                 # list them
+stomp restore <ID>                             # everything back where it was
+```
+
+The archive stays inside the directory, in `.stomp-archive/<ID>`, next to a
+`STOMP_ARCHIVED.txt` note that explains what happened. Files are packed into
+`tar.zst` chunks (50 GiB by default). Each chunk is read back and every file's
+checksum compared before any original is removed, and an original is only
+removed if it hasn't changed since it was packed. An interrupted archive
+continues with `stomp archive --resume <DIR>`. Environments, caches and files
+owned by other people stay in place.
+
+Every archive includes a `README.txt` explaining how to restore it with just
+`sha256sum`, `zstd` and `tar`. The archive never depends on stomp.
 
 ## Building
 

@@ -1,16 +1,12 @@
 //! `stomp scan`: a detailed scan, normally run as a Slurm task (§9, §14).
 
-use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1};
 
-use super::open_catalog;
+use super::{open_catalog, progress};
 use crate::config::Config;
 use crate::scan::walk::Progress;
 use crate::scan::{self, Outcome, Request, Summary};
@@ -36,12 +32,7 @@ pub fn run(cfg: &Config, config_path: &Path, data_dir: &Path, args: Args) -> Res
         );
     }
 
-    // Slurm sends USR1 shortly before the time limit (§14.2); TERM and Ctrl-C
-    // also stop the scan cleanly, keeping finished work.
-    let stop = Arc::new(AtomicBool::new(false));
-    for signal in [SIGUSR1, SIGTERM, SIGINT] {
-        signal_hook::flag::register(signal, Arc::clone(&stop))?;
-    }
+    let stop = progress::stop_flag()?;
     if let Some(id) = &args.task {
         tasks::update(data_dir, id, |s| {
             s.status = Status::Running;
@@ -62,7 +53,7 @@ pub fn run(cfg: &Config, config_path: &Path, data_dir: &Path, args: Args) -> Res
         .as_deref()
         .map(|id| tasks::progress_path(data_dir, id));
     let result = std::thread::scope(|scope| {
-        scope.spawn(|| report_progress(&progress, &finished, progress_file.as_deref()));
+        scope.spawn(|| progress::report(&finished, progress_file.as_deref(), || sample(&progress)));
         let result = scan::run(cfg, data_dir, &request, &stop, &progress);
         finished.store(true, Ordering::Relaxed);
         result
@@ -172,48 +163,24 @@ fn describe(s: &Summary) -> String {
     text
 }
 
-/// Shows progress on an interactive terminal, and writes it for `stomp tasks`.
-fn report_progress(progress: &Progress, finished: &AtomicBool, file: Option<&Path>) {
-    let interactive = std::io::stderr().is_terminal();
-    let mut last = Instant::now();
-    loop {
-        let done = finished.load(Ordering::Relaxed);
-        if done || last.elapsed() >= Duration::from_secs(10) {
-            last = Instant::now();
-            let (dirs, files, bytes) = (
-                progress.dirs.load(Ordering::Relaxed),
-                progress.files.load(Ordering::Relaxed),
-                progress.bytes.load(Ordering::Relaxed),
-            );
-            if let Some(path) = file {
-                let json = serde_json::json!({
-                    "dirs": dirs,
-                    "files": files,
-                    "bytes": bytes,
-                    "reused": progress.reused.load(Ordering::Relaxed),
-                    "units": progress.units.load(Ordering::Relaxed),
-                    "updated_at": jiff::Timestamp::now().to_string(),
-                });
-                let tmp = path.with_extension("tmp");
-                if std::fs::write(&tmp, json.to_string()).is_ok() {
-                    let _ = std::fs::rename(&tmp, path);
-                }
-            }
-            if interactive && !done {
-                eprint!(
-                    "\rstomp: scanned {} directories, {} files ({})   ",
-                    format_count(dirs),
-                    format_count(files),
-                    format_bytes(bytes)
-                );
-            }
-        }
-        if done {
-            if interactive {
-                eprint!("\r\x1b[K");
-            }
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+fn sample(progress: &Progress) -> (String, serde_json::Value) {
+    let (dirs, files, bytes) = (
+        progress.dirs.load(Ordering::Relaxed),
+        progress.files.load(Ordering::Relaxed),
+        progress.bytes.load(Ordering::Relaxed),
+    );
+    let line = format!(
+        "scanned {} directories, {} files ({})",
+        format_count(dirs),
+        format_count(files),
+        format_bytes(bytes)
+    );
+    let json = serde_json::json!({
+        "dirs": dirs,
+        "files": files,
+        "bytes": bytes,
+        "reused": progress.reused.load(Ordering::Relaxed),
+        "units": progress.units.load(Ordering::Relaxed),
+    });
+    (line, json)
 }

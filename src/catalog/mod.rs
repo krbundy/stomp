@@ -4,9 +4,11 @@
 //! on `catalog.lock`. Slurm tasks and `stomp jobs log` write files to the inbox
 //! instead, and [`Catalog::ingest`] imports them (§10.2).
 
+mod archives;
 mod compute;
 mod scans;
 
+pub use archives::CatalogArchive;
 pub use compute::JobTag;
 pub use scans::{ScanInfo, last_full_scan, latest_scan, scan_id};
 
@@ -21,7 +23,30 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::attribution::Measurement;
 use crate::paths;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+const SCHEMA_V3: &str = "
+BEGIN;
+CREATE TABLE archives (
+    id           TEXT PRIMARY KEY,
+    source       TEXT NOT NULL,
+    grant_id     TEXT,
+    destination  TEXT NOT NULL,     -- 'local' or a destination name
+    location     TEXT NOT NULL,     -- the archive's directory, or its remote path
+    state        TEXT NOT NULL,     -- 'in-progress', 'complete' or 'restored'
+    created_at   TEXT,
+    finished_at  TEXT,
+    files        INTEGER NOT NULL,
+    bytes        INTEGER NOT NULL,
+    compressed   INTEGER NOT NULL,
+    chunks       INTEGER NOT NULL,
+    kept         INTEGER NOT NULL,
+    skipped      INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+PRAGMA user_version = 3;
+COMMIT;
+";
 
 const SCHEMA_V2: &str = "
 BEGIN;
@@ -221,6 +246,9 @@ impl Catalog {
         if version < 2 {
             self.conn.execute_batch(SCHEMA_V2)?;
         }
+        if version < 3 {
+            self.conn.execute_batch(SCHEMA_V3)?;
+        }
         Ok(())
     }
 
@@ -228,11 +256,12 @@ impl Catalog {
         &self.path
     }
 
-    /// Imports everything waiting in the inbox: job logs and finished scans.
-    /// Returns messages worth showing the user.
+    /// Imports everything waiting in the inbox: job logs, finished scans and
+    /// archive records. Returns messages worth showing the user.
     pub fn ingest(&mut self, data_dir: &Path) -> Result<Vec<String>> {
         let mut messages = self.ingest_job_logs(&crate::jobs::inbox_dir(data_dir))?;
         messages.extend(self.ingest_scans(&crate::scan::inbox_dir(data_dir))?);
+        messages.extend(self.ingest_archives(&crate::archive::inbox_dir(data_dir))?);
         Ok(messages)
     }
 
