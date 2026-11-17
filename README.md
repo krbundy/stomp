@@ -4,8 +4,8 @@ A storage management utility for HPC users. stomp runs as you, with no root or
 admin help, and attributes your storage and Slurm jobs to the research grants
 that pay for them.
 
-The full design is in [`spec/design.md`](spec/design.md). This is milestone M1,
-which provides:
+The full design is in [`spec/design.md`](spec/design.md). Milestones M1 and M2
+are done:
 
 | Command | What it does |
 |---------|--------------|
@@ -13,10 +13,33 @@ which provides:
 | `stomp doctor` | Checks the config and environment |
 | `stomp usage` | Storage per grant, instant on CephFS; each run is saved to the history |
 | `stomp du [DIR] [-d N]` | Directory sizes with the grant each one belongs to |
-| `stomp report history` | Storage per grant over time, from saved measurements |
+| `stomp scan` | Submits a Slurm task that scans in detail: data ages, file types, environments, caches |
+| `stomp tasks` | Shows stomp's Slurm tasks; `show ID` and `cancel ID` |
+| `stomp changes` | How each grant's storage changed; `--dirs` compares two scans directory by directory |
 | `stomp jobs log GRANT` | Records that a Slurm job belongs to a grant |
+| `stomp jobs list` | Recent jobs and their grant; `retag` and `untag` fix mistakes |
+| `stomp report compute` | CPU and GPU hours per grant (`--by-month`) |
+| `stomp report grant ID` | One grant's storage and compute together |
+| `stomp report history` | Storage per grant over time, with TB-months |
+| `stomp report stale` | Big directories nothing has touched in 180 days |
+| `stomp report reclaimable` | Caches and environments, with commands to slim them down |
+| `stomp report lifecycle` | Grants that have ended or are about to, and what they still use |
 
-`usage`, `du` and `report` accept `--format table|csv|json`.
+Data commands accept `--format table|csv|json|md`.
+
+### Scans
+
+`stomp scan` runs as a Slurm task using the `[slurm]` settings in your config;
+override them per run with `--time`, `--cpus`, `--mem`, `--partition` and
+`--account`. If the task reaches its time limit, it saves what it finished and
+resubmits itself to continue. `--here` runs the scan in the foreground instead.
+
+On CephFS, scans after the first skip directories that haven't changed. A full
+scan runs every 30 days (`scan.full_every`), or on request with `--full`.
+
+Software environments (Apptainer sandboxes, conda environments, Python venvs),
+known caches, and anything matching `scan.exclude` are counted toward their
+grant but not scanned.
 
 ## Building
 
@@ -64,4 +87,8 @@ srun ./model
 ```
 
 `stomp jobs log` never makes a job fail. Problems are printed as warnings and
-it exits 0, unless you pass `--strict`. Compute reports arrive in milestone M2.
+it exits 0, unless you pass `--strict`.
+
+Most jobs don't even need that line. A job that runs from inside a grant's
+directory is attributed to that grant automatically. CPU and GPU hours come
+from Slurm accounting (`sacct`), which stomp imports as needed.

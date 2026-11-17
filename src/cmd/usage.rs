@@ -5,9 +5,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use super::{Format, age, local_time, rfc3339, warn};
+use super::{Format, age, local_time, open_catalog, rfc3339, warn};
 use crate::attribution::{self, GrantUsage, Measurement, RootUsage};
-use crate::catalog::Catalog;
 use crate::config::Config;
 use crate::fs::{self, Backend, BackendKind};
 use crate::paths;
@@ -29,7 +28,7 @@ pub fn run(cfg: &Config, data_dir: &Path, format: Format, record: bool) -> Resul
         warn(w);
     }
     if record {
-        let saved = Catalog::open(data_dir).and_then(|mut c| c.record(&m, &crate::sys::hostname()));
+        let saved = open_catalog(data_dir).and_then(|mut c| c.record(&m, &crate::sys::hostname()));
         if let Err(e) = saved {
             warn(format_args!(
                 "this measurement was not saved to the usage history: {e:#}"
@@ -37,7 +36,8 @@ pub fn run(cfg: &Config, data_dir: &Path, format: Format, record: bool) -> Resul
         }
     }
     match format {
-        Format::Table => print!("{}", render_table(cfg, &m)),
+        Format::Table => print!("{}", render_table(cfg, &m, false)),
+        Format::Md => print!("{}", render_table(cfg, &m, true)),
         Format::Csv => print!("{}", render_csv(&m)),
         Format::Json => println!("{}", serde_json::to_string_pretty(&m)?),
     }
@@ -54,7 +54,7 @@ pub fn detect_backends(cfg: &Config) -> Result<Vec<Box<dyn Backend>>> {
         .collect()
 }
 
-fn render_table(cfg: &Config, m: &Measurement) -> String {
+fn render_table(cfg: &Config, m: &Measurement, markdown: bool) -> String {
     let mut out = format!("Measured {}\n\n", local_time(m.taken_at));
 
     let mut roots = Table::new(&[
@@ -73,7 +73,7 @@ fn render_table(cfg: &Config, m: &Measurement) -> String {
             quota_text(r),
         ]);
     }
-    out += &roots.render();
+    out += &roots.render_as(markdown);
     out.push('\n');
 
     let mut grants = Table::new(&[
@@ -133,7 +133,7 @@ fn render_table(cfg: &Config, m: &Measurement) -> String {
         format_count(total.files),
         age(total.newest_change),
     ]);
-    out += &grants.render();
+    out += &grants.render_as(markdown);
 
     if cfg.grants.is_empty() {
         out += "\nNo grants are defined yet: add [[grant]] blocks to your config.\n";

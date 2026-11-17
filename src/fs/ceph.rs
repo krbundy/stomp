@@ -100,6 +100,10 @@ impl<X: XattrSource> Backend for CephBackend<X> {
         BackendKind::Ceph
     }
 
+    fn newest_change(&self, dir: &Path) -> io::Result<Option<i64>> {
+        self.rctime(dir)
+    }
+
     fn usage(&self, dir: &Path) -> io::Result<Usage> {
         Ok(Usage {
             bytes: self.required(dir, "ceph.dir.rbytes")?,

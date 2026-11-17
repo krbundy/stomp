@@ -45,7 +45,8 @@ pub fn run(cfg: Option<&Config>, path: Option<&Path>, depth: usize, format: Form
     let mut lines = Vec::new();
     collect(cfg, &node, 0, depth, &mut lines);
     match format {
-        Format::Table => print!("{}", render_table(cfg.is_some(), &lines)),
+        Format::Table => print!("{}", render_table(cfg.is_some(), &lines, false)),
+        Format::Md => print!("{}", render_table(cfg.is_some(), &lines, true)),
         Format::Csv => print!("{}", render_csv(&lines)),
         Format::Json => unreachable!(),
     }
@@ -126,7 +127,7 @@ fn collect(cfg: Option<&Config>, node: &Node, level: usize, depth: usize, out: &
     }
 }
 
-fn render_table(with_grants: bool, lines: &[Line]) -> String {
+fn render_table(with_grants: bool, lines: &[Line], markdown: bool) -> String {
     let mut columns = vec![
         ("SIZE", Align::Right),
         ("FILES", Align::Right),
@@ -153,7 +154,7 @@ fn render_table(with_grants: bool, lines: &[Line]) -> String {
         cells.push(line.label.clone());
         table.row(cells);
     }
-    let mut out = table.render();
+    let mut out = table.render_as(markdown);
     let unreadable = lines.first().map_or(0, |l| l.usage.unreadable);
     if unreadable > 0 {
         out += &format!(

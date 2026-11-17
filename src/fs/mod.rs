@@ -108,6 +108,12 @@ pub trait Backend: Send + Sync {
     /// The quota that applies to `dir`, if the filesystem exposes one.
     fn quota(&self, dir: &Path) -> io::Result<Option<Quota>>;
 
+    /// The newest change time anywhere under `dir`, if known without walking
+    /// it. Incremental scans use this to skip unchanged subtrees (§9.2).
+    fn newest_change(&self, _dir: &Path) -> io::Result<Option<i64>> {
+        Ok(None)
+    }
+
     /// Whether usage is available without walking the tree.
     fn is_instant(&self) -> bool {
         self.kind() == BackendKind::Ceph

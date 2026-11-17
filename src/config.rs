@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -82,6 +83,8 @@ struct RawScan {
     rctime_margin: Option<String>,
     #[serde(default)]
     exclude: Vec<String>,
+    fold_bytes: Option<String>,
+    fold_files: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -97,7 +100,6 @@ struct RawArchive {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCompute {
-    #[allow(dead_code)] // used from milestone M2
     infer_from_workdir: Option<bool>,
     history_start: Option<toml::value::Datetime>,
 }
@@ -207,6 +209,10 @@ pub struct Config {
     pub destinations: Vec<Destination>,
     pub slurm: SlurmConfig,
     pub scan: ScanConfig,
+    pub compute: ComputeConfig,
+    pub rates: Rates,
+    /// Where archive chunks are built; `None` means inside the archived directory.
+    pub staging_dir: Option<PathBuf>,
     /// Problems that don't stop stomp from working, such as a missing grant directory.
     pub warnings: Vec<String>,
 }
@@ -214,7 +220,27 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
     pub max_threads: usize,
+    /// User exclusion globs, with `~` and variables expanded.
     pub exclude: Vec<String>,
+    pub full_every: Duration,
+    pub rctime_margin: Duration,
+    /// Directories smaller than both of these are folded into their parent (§9.3).
+    pub fold_bytes: u64,
+    pub fold_files: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComputeConfig {
+    pub infer_from_workdir: bool,
+    pub history_start: Option<jiff::civil::Date>,
+}
+
+/// Optional rates for cost estimates in reports.
+#[derive(Debug, Clone, Default)]
+pub struct Rates {
+    pub per_tb_month: Option<f64>,
+    pub per_cpu_hour: Option<f64>,
+    pub per_gpu_hour: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +414,19 @@ impl Validator {
         self.destinations(&raw.destinations);
         self.references(&raw);
         self.settings(&raw);
+        // Invalid values were reported by `settings`; fall back to defaults here.
+        let duration = |value: &Option<String>, default: u64| {
+            value
+                .as_deref()
+                .and_then(|v| units::parse_duration(v).ok())
+                .unwrap_or(Duration::from_secs(default))
+        };
+        let exclude = raw
+            .scan
+            .exclude
+            .iter()
+            .filter_map(|pattern| self.exclude_pattern(pattern))
+            .collect();
         Config {
             source: source.to_path_buf(),
             roots,
@@ -396,9 +435,58 @@ impl Validator {
             slurm: raw.slurm,
             scan: ScanConfig {
                 max_threads: raw.scan.max_threads.unwrap_or(DEFAULT_MAX_THREADS),
-                exclude: raw.scan.exclude,
+                exclude,
+                full_every: duration(&raw.scan.full_every, 30 * 86_400),
+                rctime_margin: duration(&raw.scan.rctime_margin, 3600),
+                fold_bytes: raw
+                    .scan
+                    .fold_bytes
+                    .as_deref()
+                    .and_then(|v| units::parse_size(v).ok())
+                    .unwrap_or(1024 * 1024),
+                fold_files: raw.scan.fold_files.unwrap_or(100),
             },
+            compute: ComputeConfig {
+                infer_from_workdir: raw.compute.infer_from_workdir.unwrap_or(true),
+                history_start: raw
+                    .compute
+                    .history_start
+                    .as_ref()
+                    .and_then(|d| to_date(d).ok()),
+            },
+            rates: Rates {
+                per_tb_month: raw.general.rate_per_tb_month,
+                per_cpu_hour: raw.general.rate_per_cpu_hour,
+                per_gpu_hour: raw.general.rate_per_gpu_hour,
+            },
+            staging_dir: raw
+                .general
+                .staging_dir
+                .as_deref()
+                .and_then(|d| paths::expand(d).ok()),
             warnings: Vec::new(),
+        }
+    }
+
+    /// Expands a leading `~` or variables in an exclusion glob and checks its syntax.
+    fn exclude_pattern(&mut self, pattern: &str) -> Option<String> {
+        let expanded = if pattern.starts_with('~') || pattern.contains('$') {
+            match paths::expand(pattern) {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(e) => {
+                    self.error(format!("scan.exclude: {e:#}"));
+                    return None;
+                }
+            }
+        } else {
+            pattern.to_string()
+        };
+        match globset::Glob::new(&expanded) {
+            Ok(_) => Some(expanded),
+            Err(e) => {
+                self.error(format!("scan.exclude: {pattern:?}: {e}"));
+                None
+            }
         }
     }
 
@@ -667,10 +755,15 @@ impl Validator {
                 self.error(format!("{field}: {e:#}"));
             }
         }
-        if let Some(size) = &raw.archive.chunk_size
-            && let Err(e) = units::parse_size(size)
-        {
-            self.error(format!("archive.chunk_size: {e:#}"));
+        for (field, value) in [
+            ("archive.chunk_size", &raw.archive.chunk_size),
+            ("scan.fold_bytes", &raw.scan.fold_bytes),
+        ] {
+            if let Some(size) = value
+                && let Err(e) = units::parse_size(size)
+            {
+                self.error(format!("{field}: {e:#}"));
+            }
         }
         if let Some(level) = raw.archive.zstd_level
             && !(1..=22).contains(&level)

@@ -1,9 +1,18 @@
 # stomp: Design Specification
 
-**Status:** Draft v0.3 (2026-11-16)
+**Status:** Draft v0.4 (2026-11-17). Milestones M1 and M2 are implemented.
 **Scope:** Behavior and architecture for the first releases. Open questions are listed in §24.
 
-**Changes since v0.2:**
+**Changes since v0.3** (decisions made while building M2):
+- **Ages are stored as months, not age bands.** Each directory keeps a histogram of files and bytes per modification month; reports turn it into age bands at report time (§9.3, D18).
+- **File types and largest files** are recorded only by full scans that weren't interrupted (§9.3).
+- **Interrupted scans resume by work unit**: the directories two levels below each root (§9.2).
+- **`stomp changes`** compares grants with a recorded measurement by default; `--dirs` compares two scans (§11, D20).
+- **Retagging order:** `stomp jobs retag <GRANT> <JOB>...`, matching `jobs log` (§15.1).
+- **Markdown output:** reports gained `--format md`.
+- **Deferred:** HTML reports, the per-file index (`track_files`), and `jobs log --name` (§22).
+
+**Changes in v0.3:**
 - The S3 destination targets DigitalOcean Spaces first (§13.3.7). Q4 is resolved.
 - Glacier and Deep Archive (M6) and splitting a job across grants (former Q6) are deferred.
 
@@ -328,7 +337,10 @@ A scan collects what Ceph's totals can't provide:
 - **Unreadable directories** are recorded with the error and skipped.
 - **Incremental (Ceph only).** If a subtree's change time is older than (previous scan start − `rctime_margin`), it is skipped and its totals from the previous scan are reused.
 - **Full rescan.** A full rescan runs every `scan.full_every`, or on request with `--full`. This catches anything the lag described in §6.1 caused an incremental scan to miss.
-- **Resumable.** stomp asks Slurm to signal the task shortly before its wall-time limit (`--signal=B:USR1@300`). On that signal, the scan saves a checkpoint listing the subtrees it has finished and exits marked *incomplete*. `stomp scan --resume`, or an automatic resubmit, continues from the checkpoint.
+- **Resumable.** Directories two levels below each root are *work units*. Each unit is saved to the scan's result file as soon as it finishes.
+  - stomp asks Slurm to signal the task shortly before its wall-time limit (`--signal=B:USR1@300`). On that signal, or SIGTERM or Ctrl-C, the scan stops starting new work and exits marked *incomplete*.
+  - `stomp scan --resume`, or an automatic resubmit, continues from the result file. Finished units aren't walked again; only the few directories above the units are re-read.
+  - The result file is written without waiting for the disk to sync each commit (SQLite `synchronous = OFF`, with the journal kept in place). Syncing every commit made scans about 20 times slower, and on CephFS every journal file created and deleted is a metadata-server round trip. A killed process loses nothing this way; an OS crash could lose the last few units, which resuming simply redoes (D19).
 
 ### 9.3 What is recorded
 
@@ -336,16 +348,22 @@ The catalog stores totals **per directory, not per file**. Tens of millions of p
 
 For each recorded directory:
 
-- path, parent, grant
+- path, and whether it is a root, a grant directory or an excluded directory
 - bytes and files, both directly inside the directory and in its whole subtree
-- newest and oldest mtime
-- age breakdown by bytes and by file count: `<30d`, `30–90d`, `90d–1y`, `1–3y`, `>3y`
-- size breakdown: `<4K`, `4K–1M`, `1M–100M`, `100M–10G`, `>10G`
+- newest and oldest mtime, and the newest change time
+- a histogram of files and bytes per **modification month**
+- a size breakdown of files and bytes: `<4K`, `4K–1M`, `1M–100M`, `100M–10G`, `>10G`
 
-For each grant and each root:
+**Why months rather than age bands.** Reports show age bands (`<30d`, `30–90d`, `90d–1y`, `1–3y`, `>3y`), computed from the month histogram at report time and accurate to about two weeks. Storing the bands themselves would go stale: an incremental scan reuses an unchanged subtree's numbers, but that subtree's files keep getting older. Months are absolute, so reused numbers stay correct (D18).
 
-- the top 20 file extensions by bytes
+**Grants aren't stored on rows.** Grant attribution comes from the current config at report time, as for usage samples (§8.2).
+
+For each grant and each root, recorded only by full scans that ran without interruption:
+
+- file extensions, by bytes and file count
 - the 100 largest files
+
+Incremental scans don't walk unchanged subtrees, and a resumed scan has lost the statistics gathered before the interruption, so neither could produce complete lists. Reports use the newest scan that has them, and say which scan that was.
 
 **Small directories are folded into their parent.** A directory under 1 MiB that also has fewer than 100 files is not stored separately; its numbers are added to its parent's (both thresholds are configurable). This bounds catalog size on trees with many tiny directories.
 
@@ -425,10 +443,15 @@ Retention, configurable:
 
 There are three levels:
 
-1. **Quick (Ceph, instant).** Compares the current totals and change times of roots and grant directories with the last sample, and lists which grants changed since then and by how much. This is the default output of `stomp changes`.
-2. **Directory-level.** Compares two scans and shows new and removed directories and the largest growth and shrinkage, by grant, down to a chosen depth:
-   `stomp changes --since 30d [--grant G] [--depth N]`
-3. **File-level.** Lists added, removed and modified files, only in directories with `track_files = true`.
+1. **Per grant** (the default): `stomp changes [--since AGE|DATE] [--grant G]`
+   - Takes a fresh measurement (instant on CephFS) and compares it with a recorded one: the newest, or the newest at or before `--since`.
+   - Shows each grant's size then and now, the change, the change in file count, and when anything last changed.
+   - This doesn't record the new measurement, so repeated runs keep comparing with the same baseline.
+2. **Directory-level:** `stomp changes --dirs [--since AGE|DATE] [--grant G] [--depth N] [--top N]`
+   - Compares the newest scan with the previous one, or with the newest scan at or before `--since`.
+   - Lists the largest growth and shrinkage under each root, or under the grant's directories, down to `--depth`, and marks directories as new or gone.
+   - Small directories are folded into their parents (§9.3), so their changes show up in the parent.
+3. **File-level** (deferred): added, removed and modified files, only in directories with `track_files = true`.
 
 stomp keeps a log of its own actions (archive, restore, deletion of originals). A drop in usage caused by archiving is labeled as such instead of looking like data loss.
 
@@ -691,8 +714,11 @@ srun ./model ...
 | Command | Effect |
 |---------|--------|
 | `stomp jobs log GRANT-A --job 123456 [--job 123457 ...]` | Tag finished jobs |
-| `stomp jobs log GRANT-A --name 'carbon_*' --since 2026-01-01` | Tag past jobs whose names match, found through `sacct`; useful for filling in history |
-| `stomp jobs retag <job-id>... <GRANT>` / `stomp jobs untag <job-id>...` | Fix mistakes |
+| `stomp jobs log GRANT-A --name 'carbon_*' --since 2026-01-01` | Tag past jobs whose names match, found through `sacct` (deferred; working-directory inference already covers most history) |
+| `stomp jobs retag <GRANT> <job-id>...` | Assign jobs to a grant by hand, overriding everything else |
+| `stomp jobs untag <job-id>...` | Remove explicit tags, falling back to working-directory inference |
+
+**Precedence when a job has several tags:** tags from `retag` (`manual`) and from stomp's tasks (`task`) always replace earlier tags. A tag logged from inside a job never replaces those two kinds, so a requeued job can't undo a manual fix.
 
 ### 15.2 Collecting accounting data
 
@@ -753,17 +779,18 @@ TOTAL           516      21,426        624
 | `stomp doctor [--submit]` | Check the environment: backend, quota, Slurm, `sacct`, scrontab, each destination (login, verification method, credential expiry), catalog size. `--submit` repeats the destination checks from a compute node. | foreground / task |
 | `stomp usage [--grant G] [--root R]` | Current storage use by grant (§8.4) | foreground |
 | `stomp du [PATH] [--depth N]` | Directory tree with sizes; instant on Ceph | foreground |
-| `stomp scan [--full] [--resume] [--here]` | Detailed scan | task |
-| `stomp changes [--since T] [--grant G] [--depth N] [--files]` | Storage change tracking (§11) | foreground |
-| `stomp report <kind> [--from --to] [--format F] [-o FILE]` | Reports (§18) | foreground |
+| `stomp scan [--full] [--resume] [--here] [--time --cpus --mem --partition --account]` | Detailed scan; the Slurm options override `[slurm]` for this task | task |
+| `stomp changes [--since T] [--dirs] [--grant G] [--depth N] [--top N]` | Storage change tracking (§11) | foreground |
+| `stomp report <kind> [options] [--format table\|csv\|json\|md]` | Reports (§18) | foreground |
 | `stomp find [--grant G] [--largest N] [--older-than T] [--ext E]` | Find files and directories, using scan data | foreground |
 | `stomp candidates` / `stomp apply` | Review and carry out proposals (§16) | foreground / task |
 | `stomp archive <DIR> [--to local\|<dest>] [--estimate] [--yes]` | Archive a directory | task |
 | `stomp archives list\|show\|verify\|move\|push` | Manage existing archives | mixed |
 | `stomp restore <ID\|PATH> [--only G] [--to DIR] [--resume]` | Restore (§12.5) | task |
 | `stomp jobs log <GRANT> [--job ID]... [--name GLOB --since T] [--note TEXT] [--strict]` | Attribute compute jobs to a grant (§15.1) | instant |
-| `stomp jobs list [--grant G] [--since T] [--unassigned]` | Compute jobs with their grant and usage | foreground |
-| `stomp jobs sync` / `retag` / `untag` | Import accounting records; fix attributions | foreground |
+| `stomp jobs list [--grant G \| --unassigned] [--since T] [--no-sync]` | Compute jobs with their grant and usage | foreground |
+| `stomp jobs sync` | Import accounting records now; other commands do it when the last import is over 15 minutes old | foreground |
+| `stomp jobs retag <GRANT> <JOB>...` / `untag <JOB>...` | Fix attributions (§15.1) | foreground |
 | `stomp tasks [list\|show\|cancel]` | stomp's own background work (§14.3) | foreground |
 | `stomp schedule enable\|disable\|status` | Recurring work (§14.4) | foreground |
 | `stomp ingest` | Import the inbox (normally automatic) | foreground |
@@ -789,11 +816,13 @@ The one exception is `stomp jobs log`, which always exits 0 unless `--strict` is
 | `history` | Per-grant storage (TB-months) and compute over time; optional cost estimates |
 | `grant <id>` | One grant's storage and compute together: directories, usage over time, age profile, top extensions, largest files, archives by destination, CPU and GPU hours by month. Suitable for a progress report or data management plan. |
 | `lifecycle` | Grants past their end date that still have data on the HPC or jobs logged to them; remote holdings by grant |
-| `stale` | Largest directories that haven't been modified in a long time, per grant, with matching proposals |
-| `reclaimable` | Caches and other reclaimable space, with the commands that clean them |
-| `changes` | Same as `stomp changes`, formatted for sharing |
+| `stale [--older-than 180d] [--grant G] [--top N]` | The largest directories with no file modified within the period. Only the topmost stale directory of each subtree is listed, since everything inside it is stale too. Matching proposals arrive with policies (M5). |
+| `reclaimable` | Caches and software environments with suggested commands, such as `apptainer cache clean`, `conda clean --all`, or `apptainer build` to turn a sandbox into one SIF file |
 
-- **Formats:** terminal table, CSV, Markdown, JSON, and HTML (one self-contained file with inline SVG charts and no external dependencies).
+`stomp changes` (§11) prints in the same formats, so it isn't repeated as a report.
+
+- **Formats:** terminal table, CSV, Markdown and JSON. HTML (one self-contained file with inline SVG charts) is deferred.
+- **CSV rows are flat and machine-friendly:** raw byte counts and RFC 3339 times. The table and Markdown formats are for people.
 - Every report states the measurement and sync times, the backend used and any caveats, such as possible lag in the Ceph totals.
 
 ## 19. TUI (later phase)
@@ -881,8 +910,8 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 
 | Milestone | Contents | Value |
 |-----------|----------|-------|
-| **M1 Usage** | config, `init`, `doctor`, storage attribution, `usage`, `du`, usage samples, basic CSV and table report, **`stomp jobs log`** (writes records to the inbox only) | Per-grant storage numbers immediately; job tags start accumulating |
-| **M2 Scan and compute** | walker, excluded directories, catalog and ingest, incremental scans, task submission, `tasks`, `changes`, **`jobs sync`, working-directory inference, `report compute`**, full reports | History, change tracking, finding stale data, compute per grant |
+| **M1 Usage** ✅ | config, `init`, `doctor`, storage attribution, `usage`, `du`, usage samples, basic CSV and table report, **`stomp jobs log`** (writes records to the inbox only) | Per-grant storage numbers immediately; job tags start accumulating |
+| **M2 Scan and compute** ✅ | walker, excluded directories, catalog and ingest, incremental scans, task submission, `tasks`, `changes`, **`jobs sync`, working-directory inference, `report compute`**, reports (`grant`, `stale`, `reclaimable`, `lifecycle`, `history` with TB-months). Deferred from M2: HTML reports, `track_files`, `jobs log --name`. | History, change tracking, finding stale data, compute per grant |
 | **M3 Local archive** | chunk format, manifests, the per-chunk steps and journal, invariants, `--estimate`, local restore | Compression in place |
 | **M4 Remote destinations** | destination interface, SFTP, S3 (standard storage classes), verification methods, partial restore, `archives move` and `archives push`, remote reports | Moving data off the HPC |
 | **M5 Automation** | policies, `candidates` and `apply`, `schedule` | Hands-off upkeep |
@@ -910,6 +939,9 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | D15 | `stomp jobs log` never fails the user's job | A tracking tool must never cost someone a compute run |
 | D16 | Accounting records are copied into the catalog | Sites purge old `sacct` records |
 | D17 | stomp's own Slurm work is called **tasks**; **jobs** means the user's compute jobs | Avoids an ambiguous `stomp jobs` command |
+| D18 | Scans store a histogram per modification month, not relative age bands | Reused subtrees stay correct as their files age; age bands are computed at report time |
+| D19 | The scan result file commits each unit without syncing to disk | About 20 times faster, and it avoids metadata-server round trips on CephFS; a killed process loses nothing, and an OS crash only means redoing a few units |
+| D20 | `stomp changes` compares grant totals by default; `--dirs` compares scans | The per-grant view is instant on Ceph and needs no scan; the directory view needs two scans |
 
 ## 24. Open questions
 

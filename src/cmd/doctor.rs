@@ -9,10 +9,8 @@ use anyhow::Result;
 use crate::catalog::Catalog;
 use crate::config::{Config, Destination};
 use crate::fs as sfs;
-use crate::jobs;
-use crate::paths;
-use crate::sys;
 use crate::units::{format_bytes, format_count};
+use crate::{cmd, compute, jobs, paths, scan, sys, tasks};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -101,19 +99,35 @@ fn check_state(r: &mut Report, data_dir: &Path) {
         Ok(()) => r.line(Status::Pass, "data dir", format!("{shown} is writable")),
         Err(e) => r.line(Status::Fail, "data dir", format!("{shown}: {e}")),
     }
+    // Doctor looks without importing, so it can report what's waiting.
     match Catalog::open(data_dir) {
         Ok(catalog) => {
             let size = fs::metadata(catalog.path()).map_or(0, |m| m.len());
-            let count = catalog.measurement_count().unwrap_or(0).max(0) as u64;
+            let count = |n: Result<i64>| format_count(n.unwrap_or(0).max(0) as u64);
             r.line(
                 Status::Pass,
                 "catalog",
                 format!(
-                    "{}, {} usage measurement(s) recorded",
+                    "{}: {} measurement(s), {} scan(s), {} job record(s)",
                     format_bytes(size),
-                    format_count(count)
+                    count(catalog.measurement_count()),
+                    count(catalog.scan_count()),
+                    count(catalog.job_count())
                 ),
             );
+            match compute::last_sync(&catalog) {
+                Ok(Some(t)) => r.line(
+                    Status::Info,
+                    "accounting",
+                    format!("last imported from sacct {}", cmd::age(Some(t))),
+                ),
+                Ok(None) => r.line(
+                    Status::Info,
+                    "accounting",
+                    "not imported yet; `stomp jobs sync` does it",
+                ),
+                Err(_) => {}
+            }
         }
         Err(e) => r.line(Status::Fail, "catalog", format!("{e:#}")),
     }
@@ -127,8 +141,39 @@ fn check_state(r: &mut Report, data_dir: &Path) {
         r.line(
             Status::Info,
             "job logs",
-            format!("{waiting} job record(s) waiting; compute reports arrive with milestone M2"),
+            format!("{waiting} job record(s) waiting to be imported"),
         );
+    }
+    if let Ok(results) = scan::list_results(&scan::inbox_dir(data_dir)) {
+        let (done, interrupted): (Vec<_>, Vec<_>) =
+            results.iter().partition(|r| r.meta.status == "complete");
+        if !done.is_empty() {
+            r.line(
+                Status::Info,
+                "scans",
+                format!("{} finished scan(s) waiting to be imported", done.len()),
+            );
+        }
+        if !interrupted.is_empty() {
+            r.line(
+                Status::Warn,
+                "scans",
+                format!(
+                    "{} interrupted scan(s); `stomp scan --resume` continues the latest",
+                    interrupted.len()
+                ),
+            );
+        }
+    }
+    if let Ok(all) = tasks::list(data_dir) {
+        let active = all.iter().filter(|t| !t.status.is_final()).count();
+        if active > 0 {
+            r.line(
+                Status::Info,
+                "tasks",
+                format!("{active} task(s) submitted or running; see `stomp tasks`"),
+            );
+        }
     }
 }
 

@@ -109,6 +109,34 @@ pub fn format_age(seconds_ago: i64) -> String {
     }
 }
 
+/// A duration such as `2h 05m`, `5m 12s` or `12s`.
+pub fn format_duration(seconds: u64) -> String {
+    match seconds {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
+        s => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// Hours for reports: one decimal below 10, otherwise whole hours with separators.
+pub fn format_hours(hours: f64) -> String {
+    if hours < 10.0 {
+        format!("{hours:.1}")
+    } else {
+        format_count(hours.round() as u64)
+    }
+}
+
+/// A signed byte change such as `+1.2 GiB` or `-300.0 MiB`.
+pub fn format_bytes_delta(delta: i128) -> String {
+    let magnitude = format_bytes(delta.unsigned_abs().min(u128::from(u64::MAX)) as u64);
+    match delta.signum() {
+        1 => format!("+{magnitude}"),
+        -1 => format!("-{magnitude}"),
+        _ => magnitude,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

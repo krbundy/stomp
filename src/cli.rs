@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 
 use crate::cmd::{self, Format};
 use crate::config::{Config, ConfigError};
+use crate::tasks::Overrides;
 use crate::{paths, sys};
 
 #[derive(Parser)]
@@ -61,12 +62,92 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Table)]
         format: Format,
     },
+    /// Scan in detail: data ages, file types, environments, archive candidates
+    ///
+    /// Outside a Slurm job this submits a Slurm task and returns. The first
+    /// scan, and one every scan.full_every, walks everything; on CephFS the
+    /// others skip directories that haven't changed.
+    Scan {
+        /// Walk everything instead of skipping unchanged directories
+        #[arg(long)]
+        full: bool,
+        /// Continue the most recent interrupted scan
+        #[arg(long)]
+        resume: bool,
+        /// Run here instead of submitting a Slurm task
+        #[arg(long)]
+        here: bool,
+        /// The task this run belongs to (set in scripts stomp generates)
+        #[arg(long, hide = true)]
+        task: Option<String>,
+        #[command(flatten)]
+        slurm: SlurmArgs,
+    },
+    /// How storage changed: per grant, or per directory with --dirs
+    Changes {
+        /// Compare with this long ago (e.g. 30d) or this date [default: the last measurement or scan]
+        #[arg(long, value_name = "AGE|DATE")]
+        since: Option<String>,
+        /// Compare two scans directory by directory
+        #[arg(long)]
+        dirs: bool,
+        /// Only this grant
+        #[arg(long)]
+        grant: Option<String>,
+        /// With --dirs: how many levels below each root or grant directory
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        /// With --dirs: how many changes to show
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
     /// Reports for grant budgets and planning
     #[command(subcommand)]
     Report(ReportCommand),
     /// Attribute Slurm compute jobs to grants
     #[command(subcommand)]
     Jobs(JobsCommand),
+    /// stomp's own Slurm tasks, such as scans
+    Tasks {
+        #[command(subcommand)]
+        action: Option<TasksCommand>,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// Import finished scans and job logs now (normally automatic)
+    Ingest,
+}
+
+/// Overrides for the [slurm] settings of a submitted task.
+#[derive(clap::Args)]
+struct SlurmArgs {
+    /// Time limit for the Slurm task, e.g. 12:00:00
+    #[arg(long, value_name = "TIME")]
+    time: Option<String>,
+    /// CPUs for the Slurm task
+    #[arg(long, value_name = "N")]
+    cpus: Option<u32>,
+    /// Memory for the Slurm task, e.g. 16G
+    #[arg(long, value_name = "SIZE")]
+    mem: Option<String>,
+    /// Slurm partition
+    #[arg(long)]
+    partition: Option<String>,
+    /// Slurm account
+    #[arg(long)]
+    account: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum TasksCommand {
+    /// List tasks (the default)
+    List,
+    /// Details and log locations for a task
+    Show { id: String },
+    /// Cancel a task's Slurm job
+    Cancel { id: String },
 }
 
 #[derive(Subcommand)]
@@ -93,6 +174,54 @@ enum ReportCommand {
         #[arg(long, value_enum, default_value_t = Format::Table)]
         format: Format,
     },
+    /// CPU and GPU hours per grant
+    Compute {
+        /// First day to include (YYYY-MM-DD) [default: 30 days ago]
+        #[arg(long, value_name = "DATE")]
+        from: Option<String>,
+        /// Last day to include (YYYY-MM-DD) [default: today]
+        #[arg(long, value_name = "DATE")]
+        to: Option<String>,
+        /// One row per grant per month
+        #[arg(long)]
+        by_month: bool,
+        /// Use already-imported accounting without running sacct
+        #[arg(long)]
+        no_sync: bool,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// One grant's storage and compute together
+    Grant {
+        /// Grant ID
+        id: String,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// Large directories with nothing modified recently
+    Stale {
+        /// No file modified within this long (e.g. 180d) or since this date
+        #[arg(long, value_name = "AGE|DATE", default_value = "180d")]
+        older_than: String,
+        /// Only this grant
+        #[arg(long)]
+        grant: Option<String>,
+        /// How many directories to show
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// Caches and software environments, and how to slim them down
+    Reclaimable {
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// Grants that have ended or are about to, and what they still use
+    Lifecycle {
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
 }
 
 #[derive(Subcommand)]
@@ -115,6 +244,39 @@ enum JobsCommand {
         /// Exit with an error instead of a warning when something goes wrong
         #[arg(long)]
         strict: bool,
+    },
+    /// Import job accounting from sacct now (normally automatic)
+    Sync,
+    /// Recent jobs and the grant each belongs to
+    List {
+        /// Only this grant
+        #[arg(long)]
+        grant: Option<String>,
+        /// Only jobs not attributed to any grant
+        #[arg(long, conflicts_with = "grant")]
+        unassigned: bool,
+        /// Jobs since this long ago (e.g. 7d) or this date [default: 30d]
+        #[arg(long, value_name = "AGE|DATE")]
+        since: Option<String>,
+        /// Use already-imported accounting without running sacct
+        #[arg(long)]
+        no_sync: bool,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// Assign jobs to a grant, overriding logs and working-directory inference
+    Retag {
+        /// Grant ID from your config
+        grant: String,
+        /// Job IDs
+        #[arg(required = true)]
+        jobs: Vec<String>,
+    },
+    /// Remove jobs' explicit grant tags
+    Untag {
+        /// Job IDs
+        #[arg(required = true)]
+        jobs: Vec<String>,
     },
 }
 
@@ -222,6 +384,129 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 note.as_deref(),
                 strict,
             ));
+        }
+        Command::Jobs(JobsCommand::Sync) => {
+            cmd::jobs::sync(&load_config(&config_path)?, &data_dir)?;
+        }
+        Command::Jobs(JobsCommand::List {
+            grant,
+            unassigned,
+            since,
+            no_sync,
+            format: f,
+        }) => {
+            let args = cmd::jobs::ListArgs {
+                grant,
+                since,
+                unassigned,
+                no_sync,
+                format: format(f),
+            };
+            cmd::jobs::list(&load_config(&config_path)?, &data_dir, &args)?;
+        }
+        Command::Jobs(JobsCommand::Retag { grant, jobs }) => {
+            cmd::jobs::retag(&load_config(&config_path)?, &data_dir, &grant, &jobs)?;
+        }
+        Command::Jobs(JobsCommand::Untag { jobs }) => {
+            cmd::jobs::untag(&data_dir, &jobs)?;
+        }
+        Command::Scan {
+            full,
+            resume,
+            here,
+            task,
+            slurm,
+        } => {
+            let cfg = load_config(&config_path)?;
+            start_threads(Some(&cfg));
+            let args = cmd::scan::Args {
+                full,
+                resume,
+                here,
+                task,
+                overrides: Overrides {
+                    time: slurm.time,
+                    cpus: slurm.cpus,
+                    mem: slurm.mem,
+                    partition: slurm.partition,
+                    account: slurm.account,
+                },
+            };
+            return cmd::scan::run(&cfg, &config_path, &data_dir, args);
+        }
+        Command::Changes {
+            since,
+            dirs,
+            grant,
+            depth,
+            top,
+            format: f,
+        } => {
+            let cfg = load_config(&config_path)?;
+            start_threads(Some(&cfg));
+            let args = cmd::changes::Args {
+                since,
+                dirs,
+                grant,
+                depth,
+                top,
+                format: format(f),
+            };
+            cmd::changes::run(&cfg, &data_dir, &args)?;
+        }
+        Command::Report(ReportCommand::Compute {
+            from,
+            to,
+            by_month,
+            no_sync,
+            format: f,
+        }) => {
+            let args = cmd::report::ComputeArgs {
+                from,
+                to,
+                by_month,
+                no_sync,
+                format: format(f),
+            };
+            cmd::report::compute(&load_config(&config_path)?, &data_dir, &args)?;
+        }
+        Command::Report(ReportCommand::Grant { id, format: f }) => {
+            cmd::report::grant(&load_config(&config_path)?, &data_dir, &id, format(f))?;
+        }
+        Command::Report(ReportCommand::Stale {
+            older_than,
+            grant,
+            top,
+            format: f,
+        }) => {
+            cmd::report::stale(
+                &load_config(&config_path)?,
+                &data_dir,
+                &older_than,
+                grant.as_deref(),
+                top,
+                format(f),
+            )?;
+        }
+        Command::Report(ReportCommand::Reclaimable { format: f }) => {
+            cmd::report::reclaimable(&load_config(&config_path)?, &data_dir, format(f))?;
+        }
+        Command::Report(ReportCommand::Lifecycle { format: f }) => {
+            cmd::report::lifecycle(&load_config(&config_path)?, &data_dir, format(f))?;
+        }
+        Command::Tasks { action, format: f } => match action {
+            None | Some(TasksCommand::List) => cmd::tasks::list(&data_dir, format(f))?,
+            Some(TasksCommand::Show { id }) => cmd::tasks::show(&data_dir, &id)?,
+            Some(TasksCommand::Cancel { id }) => cmd::tasks::cancel(&data_dir, &id)?,
+        },
+        Command::Ingest => {
+            let catalog = cmd::open_catalog(&data_dir)?;
+            println!(
+                "The catalog has {} measurement(s), {} scan(s) and {} job record(s).",
+                catalog.measurement_count()?,
+                catalog.scan_count()?,
+                catalog.job_count()?
+            );
         }
     }
     Ok(ExitCode::SUCCESS)

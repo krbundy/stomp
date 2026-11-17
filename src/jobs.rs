@@ -139,6 +139,31 @@ pub fn write_record(inbox: &Path, record: &JobLogRecord, replace: bool) -> io::R
     result
 }
 
+/// Records that the current Slurm job is a stomp task working for `grant`
+/// (`stomp` for overhead such as scans), so compute reports show it (§14.2).
+/// Best effort: a failure here must not stop the task.
+pub fn log_task(data_dir: &Path, task_id: &str, grant: &str) {
+    let Some(job_id) = std::env::var("SLURM_JOB_ID")
+        .ok()
+        .filter(|j| valid_job_id(j))
+    else {
+        return;
+    };
+    let record = JobLogRecord {
+        version: RECORD_VERSION,
+        job_id,
+        array: false,
+        grant: grant.to_string(),
+        known_grant: Some(true),
+        note: Some(format!("stomp task {task_id}")),
+        source: "task".to_string(),
+        logged_at: jiff::Timestamp::now().to_string(),
+        host: crate::sys::hostname(),
+        user: crate::sys::user_name(),
+    };
+    let _ = write_record(&inbox_dir(data_dir), &record, true);
+}
+
 /// Logs the target jobs to `grant` and returns a message per job.
 pub fn log(
     data_dir: &Path,

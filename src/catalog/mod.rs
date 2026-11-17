@@ -2,7 +2,13 @@
 //!
 //! Only the foreground CLI writes the catalog, while holding an exclusive lock
 //! on `catalog.lock`. Slurm tasks and `stomp jobs log` write files to the inbox
-//! instead (§10.2).
+//! instead, and [`Catalog::ingest`] imports them (§10.2).
+
+mod compute;
+mod scans;
+
+pub use compute::JobTag;
+pub use scans::{ScanInfo, last_full_scan, latest_scan, scan_id};
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -10,12 +16,112 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::attribution::Measurement;
 use crate::paths;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+const SCHEMA_V2: &str = "
+BEGIN;
+CREATE TABLE kv (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+CREATE TABLE job_tags (
+    job_id     TEXT PRIMARY KEY,   -- a job ID, or an array job ID covering all its tasks
+    is_array   INTEGER NOT NULL,
+    grant_id   TEXT NOT NULL,
+    source     TEXT NOT NULL,      -- 'job-script', 'manual' or 'task'
+    note       TEXT,
+    logged_at  TEXT NOT NULL,
+    host       TEXT
+);
+CREATE TABLE compute_jobs (
+    job_id       TEXT PRIMARY KEY,  -- as sacct prints it: 123, 123_4 or 123+0
+    parent_id    TEXT NOT NULL,     -- 123 for all of those
+    name         TEXT NOT NULL,
+    state        TEXT NOT NULL,
+    submit_time  INTEGER,           -- Unix seconds
+    start_time   INTEGER,
+    end_time     INTEGER,
+    elapsed_s    INTEGER NOT NULL,
+    cpu_s        INTEGER NOT NULL,
+    gpus         INTEGER NOT NULL,
+    billing      INTEGER,
+    partition    TEXT NOT NULL,
+    account      TEXT NOT NULL,
+    workdir      TEXT NOT NULL,
+    synced_at    INTEGER NOT NULL
+);
+CREATE INDEX compute_jobs_by_end ON compute_jobs(end_time);
+CREATE TABLE scans (
+    id            INTEGER PRIMARY KEY,
+    uuid          TEXT NOT NULL UNIQUE,
+    started_at    INTEGER NOT NULL,
+    finished_at   INTEGER NOT NULL,
+    full          INTEGER NOT NULL,
+    file_stats    INTEGER NOT NULL,   -- file types and largest files were recorded
+    task_id       TEXT,
+    host          TEXT,
+    dirs_walked   INTEGER NOT NULL,
+    files_walked  INTEGER NOT NULL,
+    dirs_reused   INTEGER NOT NULL,
+    detail        TEXT NOT NULL       -- 'full', 'partial' or 'pruned'
+);
+CREATE TABLE dir_stats (
+    scan_id        INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    path           BLOB NOT NULL,
+    role           TEXT,              -- 'root' or 'grant'
+    excluded       TEXT,              -- 'environment', 'cache', 'user' or 'stomp'
+    direct_bytes   INTEGER NOT NULL,
+    direct_files   INTEGER NOT NULL,
+    bytes          INTEGER NOT NULL,
+    files          INTEGER NOT NULL,
+    unreadable     INTEGER NOT NULL,
+    newest_mtime   INTEGER,
+    oldest_mtime   INTEGER,
+    newest_change  INTEGER,
+    sizes          BLOB,
+    months         BLOB,
+    reused         INTEGER NOT NULL,
+    PRIMARY KEY (scan_id, path)
+) WITHOUT ROWID;
+CREATE TABLE scan_ext (
+    scan_id  INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    scope    TEXT NOT NULL,          -- 'grant' or 'root'
+    name     TEXT NOT NULL,          -- grant ID or root path
+    ext      TEXT NOT NULL,
+    bytes    INTEGER NOT NULL,
+    files    INTEGER NOT NULL
+);
+CREATE TABLE scan_largest (
+    scan_id  INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    scope    TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    path     BLOB NOT NULL,
+    bytes    INTEGER NOT NULL,
+    mtime    INTEGER
+);
+PRAGMA user_version = 2;
+COMMIT;
+";
+
+/// Opens the catalog for reading without taking the writer lock, for Slurm
+/// tasks that only need to look things up. `None` if there is no catalog yet.
+pub fn open_read_only(data_dir: &Path) -> Result<Option<Connection>> {
+    let path = data_dir.join("catalog.db");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    conn.busy_timeout(Duration::from_secs(60))?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    // An older catalog lacks the scan tables; treat it as having no scans.
+    Ok((version >= 2).then_some(conn))
+}
 
 const SCHEMA_V1: &str = "
 BEGIN;
@@ -112,11 +218,61 @@ impl Catalog {
         if version < 1 {
             self.conn.execute_batch(SCHEMA_V1)?;
         }
+        if version < 2 {
+            self.conn.execute_batch(SCHEMA_V2)?;
+        }
         Ok(())
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Imports everything waiting in the inbox: job logs and finished scans.
+    /// Returns messages worth showing the user.
+    pub fn ingest(&mut self, data_dir: &Path) -> Result<Vec<String>> {
+        let mut messages = self.ingest_job_logs(&crate::jobs::inbox_dir(data_dir))?;
+        messages.extend(self.ingest_scans(&crate::scan::inbox_dir(data_dir))?);
+        Ok(messages)
+    }
+
+    pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// The newest measurement taken at or before `t` (Unix seconds), as (id, taken_at).
+    pub fn measurement_at_or_before(&self, t: i64) -> Result<Option<(i64, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, taken_at FROM measurements WHERE taken_at <= ?1
+                 ORDER BY taken_at DESC, id DESC LIMIT 1",
+                [t],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The samples of one measurement.
+    pub fn measurement_samples(&self, id: i64) -> Result<Vec<Sample>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.taken_at, s.kind, s.path, s.grant_id, s.bytes, s.files
+             FROM usage_samples s JOIN measurements m ON m.id = s.measurement_id
+             WHERE m.id = ?1",
+        )?;
+        let rows = stmt.query_map([id], sample_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Records a usage measurement and returns its ID.
@@ -179,17 +335,7 @@ impl Catalog {
         )?;
         let rows = stmt.query_map(
             params![from.unwrap_or(i64::MIN), to.unwrap_or(i64::MAX)],
-            |row| {
-                Ok(Sample {
-                    measurement_id: row.get(0)?,
-                    taken_at: row.get(1)?,
-                    kind: row.get(2)?,
-                    path: row.get(3)?,
-                    grant_id: row.get(4)?,
-                    bytes: row.get::<_, i64>(5)?.max(0) as u64,
-                    files: row.get::<_, i64>(6)?.max(0) as u64,
-                })
-            },
+            sample_from_row,
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -199,6 +345,18 @@ impl Catalog {
             .conn
             .query_row("SELECT count(*) FROM measurements", [], |row| row.get(0))?)
     }
+}
+
+fn sample_from_row(row: &rusqlite::Row) -> rusqlite::Result<Sample> {
+    Ok(Sample {
+        measurement_id: row.get(0)?,
+        taken_at: row.get(1)?,
+        kind: row.get(2)?,
+        path: row.get(3)?,
+        grant_id: row.get(4)?,
+        bytes: row.get::<_, i64>(5)?.max(0) as u64,
+        files: row.get::<_, i64>(6)?.max(0) as u64,
+    })
 }
 
 #[cfg(test)]

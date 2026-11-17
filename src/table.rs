@@ -1,4 +1,6 @@
-//! Plain-text tables and CSV rows.
+//! Plain-text and Markdown tables, multi-section documents, and CSV.
+
+use serde::Serialize;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Align {
@@ -38,6 +40,40 @@ impl Table {
     /// Adds a horizontal separator line.
     pub fn rule(&mut self) {
         self.rows.push(Row::Rule);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.rows.iter().any(|r| matches!(r, Row::Cells(_)))
+    }
+
+    /// Renders as plain text, or as a Markdown table.
+    pub fn render_as(&self, markdown: bool) -> String {
+        if markdown {
+            self.render_markdown()
+        } else {
+            self.render()
+        }
+    }
+
+    pub fn render_markdown(&self) -> String {
+        let escape = |s: &str| s.replace('|', "\\|");
+        let line = |cells: Vec<String>| format!("| {} |\n", cells.join(" | "));
+        let mut out = line(self.columns.iter().map(|(h, _)| escape(h)).collect());
+        out += &line(
+            self.columns
+                .iter()
+                .map(|(_, align)| match align {
+                    Align::Left => "---".to_string(),
+                    Align::Right => "---:".to_string(),
+                })
+                .collect(),
+        );
+        for row in &self.rows {
+            if let Row::Cells(cells) = row {
+                out += &line(cells.iter().map(|c| escape(c)).collect());
+            }
+        }
+        out
     }
 
     pub fn render(&self) -> String {
@@ -93,6 +129,86 @@ impl Table {
         out.push_str(line.trim_end());
         out.push('\n');
     }
+}
+
+/// A report with headings, text and tables, rendered as plain text or Markdown.
+#[derive(Default)]
+pub struct Document {
+    parts: Vec<Part>,
+}
+
+enum Part {
+    Title(String),
+    Heading(String),
+    Text(String),
+    Table(Table),
+}
+
+impl Document {
+    pub fn title(&mut self, text: impl Into<String>) {
+        self.parts.push(Part::Title(text.into()));
+    }
+
+    pub fn heading(&mut self, text: impl Into<String>) {
+        self.parts.push(Part::Heading(text.into()));
+    }
+
+    pub fn text(&mut self, text: impl Into<String>) {
+        self.parts.push(Part::Text(text.into()));
+    }
+
+    pub fn table(&mut self, table: Table) {
+        self.parts.push(Part::Table(table));
+    }
+
+    pub fn render(&self, markdown: bool) -> String {
+        let mut out = String::new();
+        for part in &self.parts {
+            match part {
+                Part::Title(t) if markdown => out += &format!("# {t}\n\n"),
+                Part::Title(t) => out += &format!("{t}\n{}\n\n", "=".repeat(t.chars().count())),
+                Part::Heading(h) if markdown => out += &format!("## {h}\n\n"),
+                Part::Heading(h) => out += &format!("\n{h}\n{}\n", "-".repeat(h.chars().count())),
+                Part::Text(t) if markdown => out += &format!("{t}\n\n"),
+                Part::Text(t) => out += &format!("{t}\n"),
+                Part::Table(t) => {
+                    out += &t.render_as(markdown);
+                    if markdown {
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Renders serializable rows as CSV: one column per field of the first row.
+/// Nested values are written as JSON.
+pub fn csv_from_rows<T: Serialize>(rows: &[T]) -> serde_json::Result<String> {
+    let values: Vec<serde_json::Value> = rows
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()?;
+    let Some(serde_json::Value::Object(first)) = values.first() else {
+        return Ok(String::new());
+    };
+    let headers: Vec<String> = first.keys().cloned().collect();
+    let mut out = csv_row(&headers);
+    out.push('\n');
+    for value in &values {
+        let cells: Vec<String> = headers
+            .iter()
+            .map(|h| match value.get(h) {
+                None | Some(serde_json::Value::Null) => String::new(),
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+            })
+            .collect();
+        out += &csv_row(&cells);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Formats one CSV row, quoting fields that need it.
