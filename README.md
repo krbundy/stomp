@@ -5,7 +5,7 @@ admin help, and attributes your storage and Slurm jobs to the research grants
 that pay for them.
 
 The full design is in [`spec/design.md`](spec/design.md). Milestones M1 through
-M5 are done:
+M5 and M7 are done (M6, cold storage, is deferred):
 
 | Command | What it does |
 |---------|--------------|
@@ -30,6 +30,7 @@ M5 are done:
 | `stomp candidates` | Directories your policies propose to archive, with what archiving would free; `dismiss ID` |
 | `stomp apply ID...` | Archives proposed directories, each checked again first |
 | `stomp schedule enable` | A small daily Slurm job: usage, accounting, a weekly scan, proposals; `status`, `disable` |
+| `stomp tui [DIR]` | Browse interactively, ncdu-style: sizes, grants, marks; assign, estimate, archive, restore |
 
 Data commands accept `--format table|csv|json|md`.
 
@@ -138,6 +139,22 @@ stomp schedule status            # how the last run went
 The daily run records a usage sample, imports job accounting, submits a scan
 once a week, updates the proposals, and archives those from `apply` policies
 once their wait has passed (at most three a day, each checked again first).
+
+### The browser
+
+`stomp tui` is an ncdu-style browser over your roots. Sizes are live on
+CephFS; elsewhere they're measured as you go. Names are colored by grant, and
+environments, caches, archives and archive proposals are marked.
+
+| Key | Does |
+|-----|------|
+| arrows, `h` `j` `k` `l`, Enter | move around |
+| `s` | sort by size, name, file count, or oldest first |
+| `i` | details and history: sizes from past scans and usage samples |
+| `c` | jobs, CPU-hours and GPU-hours per grant over 30 days |
+| `g` | add the directory to a grant or remove it (edits the config, keeping a `.bak`) |
+| `e` `a` `r` | estimate, archive or restore, through the same commands and questions as the CLI |
+| `?` `q` | help, quit |
 
 ### Trying it on your cluster
 

@@ -18,4 +18,5 @@ pub mod scan;
 pub mod sys;
 pub mod table;
 pub mod tasks;
+pub mod tui;
 pub mod units;

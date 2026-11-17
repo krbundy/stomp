@@ -244,6 +244,17 @@ enum Command {
         #[command(flatten)]
         slurm: SlurmArgs,
     },
+    /// Browse your roots interactively, ncdu-style
+    ///
+    /// Sizes are live on CephFS and measured as you go elsewhere. Directories
+    /// are colored by grant; environments, caches, archives and proposals
+    /// are marked. Keys add a directory to a grant (editing the config),
+    /// show its history, and estimate, archive or restore it. Press ? inside
+    /// for help.
+    Tui {
+        /// Where to start [default: your root]
+        dir: Option<PathBuf>,
+    },
     /// A daily run that keeps usage, accounting, scans and proposals current
     #[command(subcommand)]
     Schedule(ScheduleCommand),
@@ -905,6 +916,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 return cmd::schedule::run(&cfg, &config_path, &data_dir, chain);
             }
         },
+        Command::Tui { dir } => {
+            let cfg = load_config(&config_path)?;
+            start_threads(Some(&cfg));
+            return crate::tui::run(cfg, &config_path, &data_dir, dir.as_deref());
+        }
         Command::Ingest => {
             let catalog = cmd::open_catalog(&data_dir)?;
             println!(

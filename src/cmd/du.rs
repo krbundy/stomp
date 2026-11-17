@@ -81,7 +81,7 @@ fn collect(cfg: Option<&Config>, node: &Node, level: usize, depth: usize, out: &
         path: node.path.display().to_string(),
         loose_files: false,
         grant: grant_label(cfg, &node.path),
-        usage: node.usage.clone(),
+        usage: node.usage,
     });
     if level >= depth || node.children.is_empty() {
         return;

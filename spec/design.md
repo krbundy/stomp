@@ -1,9 +1,14 @@
 # stomp: Design Specification
 
-**Status:** Draft v0.7 (2026-11-17). Milestones M1 through M5 are implemented.
+**Status:** Draft v0.8 (2026-11-17). Milestones M1 through M5 and M7 are implemented; M6 (cold storage) is deferred.
 **Scope:** Behavior and architecture for the first releases. Open questions are listed in §24.
 
-**Changes since v0.6** (decisions made while building M5, automation; details in §16.1 and §14.4):
+**Changes since v0.7** (decisions made while building M7, the TUI; details in §19.1):
+- **Actions leave the browser** and run the CLI's own commands, with their usual questions and checks (D34).
+- **Grant assignment edits the config in place**, keeping comments and layout, checking the result first, and keeping a `.bak` copy (D35).
+- **Sizes are measured as you browse** (instant on CephFS, a walk elsewhere); the TUI doesn't read scan data for sizes.
+
+**Changes in v0.7** (decisions made while building M5, automation; details in §16.1 and §14.4):
 - **Proposals come only from grant data** unless a policy names a `path`, and never from hidden directories that way either (D29).
 - **"Unchanged" means neither modified nor changed** (mtime and ctime), so freshly copied or restored data isn't proposed straight away (D30).
 - **One small daily job** does the scheduled work; the weekly scan is a separate task it submits (D31).
@@ -1020,7 +1025,7 @@ TOTAL           516      21,426        624
 | `stomp tasks [list\|show\|cancel]` | stomp's own background work (§14.3) | foreground |
 | `stomp schedule enable [--at HH:MM] [--mode scrontab\|task]` / `disable` / `status` / `run` | The daily run (§14.4) | foreground / scheduled |
 | `stomp ingest` | Import the inbox (normally automatic) | foreground |
-| `stomp tui` | Interactive browser (later phase, §19) | foreground |
+| `stomp tui [DIR]` | Interactive browser (§19.1) | foreground |
 
 **Exit codes:**
 
@@ -1051,13 +1056,53 @@ The one exception is `stomp jobs log`, which always exits 0 unless `--strict` is
 - **CSV rows are flat and machine-friendly:** raw byte counts and RFC 3339 times. The table and Markdown formats are for people.
 - Every report states the measurement and sync times, the backend used and any caveats, such as possible lag in the Ceph totals.
 
-## 19. TUI (later phase)
+## 19. TUI
 
 - An `ncdu`-style tree browser built with `ratatui` on the same core library as the CLI.
 - **On Ceph, sizes come live from the directory totals,** so browsing needs no scan.
 - **Display:** colored by grant; excluded directories and archived directories are marked.
 - **Actions:** assign a directory to a grant (edits the config), estimate, archive, restore and view the change history.
 - **A compute panel** shows recent jobs per grant.
+
+### 19.1 As built (M7)
+
+`stomp tui [DIR]` starts at DIR, at the root if there is one, or at a list of the roots if there are several. It needs a terminal.
+
+**What it shows.**
+
+- **One row per entry** of the current directory, largest first, ncdu-style: size, a bar relative to the largest entry, file count, age (newest change), grant, and name.
+- **Sorting.** `s` cycles through size, name, file count, and oldest first. Hidden entries are shown.
+- **Colors.** Names and grant labels are colored per grant, in config order. Excluded directories and archive data are grey.
+- **Marks:**
+  - `[environment]`, `[cache]`, `[excluded]`, `[stomp data]`
+  - `[archived ID]`, or `[archiving ID]` while unfinished
+  - `[archive data]`
+  - `[grants A, B]` for directories that contain grant directories
+  - `[proposed #N]` for open archive proposals (§16)
+- **The header** shows the path, the grant of the current directory and its end date, and the total. It also shows whether sizes are live (CephFS) or still being measured, the quota where the filesystem has one, and the sort.
+
+**How sizes are measured.**
+
+- A background thread measures each listed directory with the filesystem backend. On CephFS that's instant; elsewhere it's a walk.
+- The same pass checks for environment markers and archives.
+- Results are cached for the session, so returning to a directory is instant. `R` measures again.
+- Moving on supersedes the measurements still waiting for the previous directory.
+
+**Keys.**
+
+- **Moving:** arrows or `h`/`j`/`k`/`l`, `Enter`, `Backspace`, `PgUp`/`PgDn`/`Home`/`End`.
+- **Info (`i`):** grant, size, marks, proposal and archive location. It also shows the directory's size in up to 8 past scans and, for roots and grant directories, the last 10 days of usage samples.
+- **Compute (`c`):** a panel of jobs, CPU-hours and GPU-hours per grant over the last 30 days. The current grant is highlighted, and the panel says when accounting was last imported.
+- **Grant (`g`) (D35):** pick a grant to add the directory to, or remove it if it's listed as a grant directory.
+  - **The edit keeps the file's comments and layout** (`toml_edit`).
+  - **It's checked first.** The result is loaded as a config, so overlaps and nesting are refused with the validator's own message.
+  - **The previous file is saved** as `config.toml.bak`, and the TUI carries on with the new config.
+- **Estimate, archive and restore (`e`, `a`, `r`) (D34):**
+  - **stomp's own checks run first.** A directory that can't be archived (an environment, one holding other grants, already archived) gets an explanation without leaving the screen.
+  - **Then the browser steps aside.** It runs `stomp archive DIR --estimate`, `stomp archive DIR` or `stomp restore DIR` as the CLI would, with the same output, questions and task submission, and returns on Enter.
+- **`?`** shows help; **`q`** or **Esc** quits.
+
+**Terminal handling.** stomp never asks the terminal for its cursor position, since that question can time out over a slow SSH connection. A panic restores the terminal before its message is printed.
 
 ## 20. Implementation
 
@@ -1093,7 +1138,7 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | Dates and durations | `jiff` |
 | Errors and logging | `thiserror`, `anyhow`, `tracing` |
 | Progress output | `indicatif` |
-| TUI (later) | `ratatui`, `crossterm` |
+| TUI | `ratatui` (with `crossterm`); `toml_edit` for editing the config |
 
 ### 20.3 Build and distribution
 
@@ -1142,7 +1187,7 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | **M4 Remote destinations** ✅ | destination interface, SFTP, S3 (standard storage classes), verification methods, partial restore, `archives move` (which also covers the planned `push`), remote reports, destination checks in `doctor` | Moving data off the HPC |
 | **M5 Automation** ✅ | policies, `candidates` and `apply`, `schedule` | Hands-off upkeep |
 | **M6 Cold storage** (deferred) | S3 Glacier and Deep Archive: thaw requests, two-phase restores, cost estimates | Cheap long-term archives |
-| **M7 TUI** | Interactive browser | Convenience |
+| **M7 TUI** ✅ | Interactive browser | Convenience |
 
 ## 23. Decisions
 
@@ -1181,6 +1226,8 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | D31 | One small daily job; the weekly scan is a task it submits | Short jobs start quickly; scans get the resources and checkpointing they need |
 | D32 | Automatic archiving needs an age condition, waits after the first proposal (7 days by default), checks again, and starts at most 3 a run | Time to notice and dismiss; nothing changing is archived; no queue floods |
 | D33 | The daily run writes the catalog briefly, like an interactive command | The usage sample and accounting import are seconds of work; routing them through the inbox would only add delay |
+| D34 | TUI actions step out to the CLI's own commands | One implementation of each check, question and message; nothing destructive is reimplemented |
+| D35 | The TUI edits the config in place, validating first and keeping a `.bak` | Users' comments and layout survive; a bad edit is never saved |
 
 ## 24. Open questions
 

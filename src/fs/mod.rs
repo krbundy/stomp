@@ -40,7 +40,7 @@ impl BackendKind {
 }
 
 /// Usage of a directory subtree.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     /// Total logical size of the files.
     pub bytes: u64,

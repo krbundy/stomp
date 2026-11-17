@@ -142,7 +142,7 @@ pub fn measure(cfg: &Config, backends: &[Box<dyn Backend>]) -> Measurement {
             ));
             Usage::default()
         });
-        let mut total = unassigned.clone();
+        let mut total = unassigned;
         for dir in grants.iter().flat_map(|g| &g.dirs).filter(|d| d.root == ri) {
             if let Some(u) = &dir.usage {
                 total.add(u);
