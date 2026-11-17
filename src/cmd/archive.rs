@@ -81,26 +81,14 @@ pub fn archive(
             threads,
             ..archive::load_settings(path)?
         },
-        None => {
-            let grant = cfg.grant_for(&dir).map(|g| g.id.clone());
-            Settings {
-                id: args
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| archive::new_id(grant.as_deref())),
-                source: dir.clone(),
-                grant,
-                chunk_size: match &args.chunk_size {
-                    Some(s) => parse_size(s)?.max(1 << 20),
-                    None => cfg.archive.chunk_size,
-                },
-                level: args.level.unwrap_or(cfg.archive.zstd_level).clamp(1, 22),
-                threads,
-                only_owned: cfg.archive.only_owned,
-                destination: destination.clone(),
-                staging: cfg.staging_dir.clone(),
-            }
-        }
+        None => new_settings(
+            cfg,
+            &dir,
+            &destination,
+            args.level,
+            args.chunk_size.as_deref(),
+            args.id.clone(),
+        )?,
     };
 
     if args.dry_run || args.estimate {
@@ -121,25 +109,7 @@ pub fn archive(
     }
     check_headroom(&settings)?;
     if !running_here {
-        let task_args = vec![
-            "archive".to_string(),
-            dir.to_string_lossy().into_owned(),
-            "--yes".into(),
-            "--id".into(),
-            settings.id.clone(),
-            "--level".into(),
-            settings.level.to_string(),
-            "--chunk-size".into(),
-            settings.chunk_size.to_string(),
-        ];
-        let state = tasks::submit(
-            cfg,
-            config_path,
-            data_dir,
-            "archive",
-            &task_args,
-            &args.overrides,
-        )?;
+        let state = submit_archive(cfg, config_path, data_dir, &settings, &args.overrides)?;
         println!(
             "Submitted archive task {} as Slurm job {}. Follow it with `stomp tasks`.",
             state.id,
@@ -149,6 +119,62 @@ pub fn archive(
         return Ok(ExitCode::SUCCESS);
     }
     run_archive(cfg, data_dir, &settings, args.task.as_deref())
+}
+
+/// Settings for a new archive of `dir` (canonical), with the config's defaults.
+pub fn new_settings(
+    cfg: &Config,
+    dir: &Path,
+    destination: &str,
+    level: Option<i32>,
+    chunk_size: Option<&str>,
+    id: Option<String>,
+) -> Result<Settings> {
+    let grant = cfg.grant_for(dir).map(|g| g.id.clone());
+    Ok(Settings {
+        id: id.unwrap_or_else(|| archive::new_id(grant.as_deref())),
+        source: dir.to_path_buf(),
+        grant,
+        chunk_size: match chunk_size {
+            Some(s) => parse_size(s)?.max(1 << 20),
+            None => cfg.archive.chunk_size,
+        },
+        level: level.unwrap_or(cfg.archive.zstd_level).clamp(1, 22),
+        threads: sys::effective_threads(cfg.scan.max_threads) as u32,
+        only_owned: cfg.archive.only_owned,
+        destination: destination.to_string(),
+        staging: cfg.staging_dir.clone(),
+    })
+}
+
+/// Submits a Slurm task that archives with these settings.
+pub fn submit_archive(
+    cfg: &Config,
+    config_path: &Path,
+    data_dir: &Path,
+    settings: &Settings,
+    overrides: &Overrides,
+) -> Result<tasks::TaskState> {
+    let task_args = vec![
+        "archive".to_string(),
+        settings.source.to_string_lossy().into_owned(),
+        "--yes".into(),
+        "--to".into(),
+        settings.destination.clone(),
+        "--id".into(),
+        settings.id.clone(),
+        "--level".into(),
+        settings.level.to_string(),
+        "--chunk-size".into(),
+        settings.chunk_size.to_string(),
+    ];
+    tasks::submit(cfg, config_path, data_dir, "archive", &task_args, overrides)
+}
+
+/// Archives with these settings here, in the foreground.
+pub fn archive_here(cfg: &Config, data_dir: &Path, settings: &Settings) -> Result<ExitCode> {
+    check_headroom(settings)?;
+    run_archive(cfg, data_dir, settings, None)
 }
 
 fn print_intent(s: &Settings, resuming: bool) {
@@ -188,7 +214,7 @@ fn print_intent(s: &Settings, resuming: bool) {
 }
 
 /// Refuses to start without room under the quota for the chunk being written (§12.4).
-fn check_headroom(s: &Settings) -> Result<()> {
+pub(crate) fn check_headroom(s: &Settings) -> Result<()> {
     let backend = fs::detect(&s.source)?;
     if let Ok(Some(quota)) = backend.quota(&s.source)
         && let Some(max) = quota.max_bytes

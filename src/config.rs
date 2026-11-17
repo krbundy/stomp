@@ -43,9 +43,38 @@ struct RawConfig {
     destinations: Vec<Destination>,
     #[serde(default, rename = "grant")]
     grants: Vec<RawGrant>,
-    /// Policies are interpreted in milestone M5; for now only their references are checked.
     #[serde(default, rename = "policy")]
-    policies: Vec<toml::Table>,
+    policies: Vec<RawPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicy {
+    name: Option<String>,
+    #[serde(rename = "match", default)]
+    conditions: RawConditions,
+    action: Option<String>,
+    destination: Option<String>,
+    wait: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConditions {
+    grant: Option<OneOrMany>,
+    path: Option<String>,
+    grant_ended_for: Option<String>,
+    unchanged_for: Option<String>,
+    min_bytes: Option<String>,
+    min_files: Option<u64>,
+    max_avg_file_size: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +242,8 @@ pub struct Config {
     pub rates: Rates,
     /// Where archive chunks are built; `None` means inside the archived directory.
     pub staging_dir: Option<PathBuf>,
+    /// Rules proposing directories to archive (§16).
+    pub policies: Vec<Policy>,
     /// Problems that don't stop stomp from working, such as a missing grant directory.
     pub warnings: Vec<String>,
 }
@@ -245,6 +276,52 @@ pub struct ArchiveConfig {
     /// `local` or a destination name.
     pub default_destination: String,
 }
+
+/// A rule that proposes directories to archive (§16).
+#[derive(Debug, Clone)]
+pub struct Policy {
+    pub name: String,
+    pub conditions: Conditions,
+    pub action: PolicyAction,
+    /// `local` or a destination name.
+    pub destination: String,
+    /// How long an `apply` proposal waits before stomp archives it.
+    pub wait: Duration,
+}
+
+/// What a directory must satisfy to be proposed. Every condition given must hold.
+#[derive(Debug, Clone, Default)]
+pub struct Conditions {
+    /// Grant IDs; empty means any grant.
+    pub grants: Vec<String>,
+    /// A glob with `~` expanded; `*` doesn't cross `/`.
+    pub path: Option<String>,
+    pub grant_ended_for: Option<Duration>,
+    pub unchanged_for: Option<Duration>,
+    pub min_bytes: Option<u64>,
+    pub min_files: Option<u64>,
+    pub max_avg_file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyAction {
+    /// List the directory in `stomp candidates`.
+    Propose,
+    /// Also archive it automatically once `wait` has passed.
+    Apply,
+}
+
+impl PolicyAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyAction::Propose => "propose",
+            PolicyAction::Apply => "apply",
+        }
+    }
+}
+
+/// How long an automatic proposal waits by default, so it can be dismissed.
+pub const DEFAULT_POLICY_WAIT: Duration = Duration::from_secs(7 * 86_400);
 
 /// Optional rates for cost estimates in reports.
 #[derive(Debug, Clone, Default)]
@@ -425,6 +502,7 @@ impl Validator {
         self.destinations(&raw.destinations);
         self.references(&raw);
         self.settings(&raw);
+        let policies = self.policies(&raw, &grants);
         // Invalid values were reported by `settings`; fall back to defaults here.
         let duration = |value: &Option<String>, default: u64| {
             value
@@ -490,6 +568,7 @@ impl Validator {
                 .staging_dir
                 .as_deref()
                 .and_then(|d| paths::expand(d).ok()),
+            policies,
             warnings: Vec::new(),
         }
     }
@@ -741,29 +820,164 @@ impl Validator {
                 "archive.default_destination: no destination named {name:?}"
             ));
         }
-        for (i, policy) in raw.policies.iter().enumerate() {
-            let label = match policy.get("name").and_then(|v| v.as_str()) {
+    }
+
+    /// Validates the `[[policy]]` blocks (§16).
+    fn policies(&mut self, raw: &RawConfig, grants: &[Grant]) -> Vec<Policy> {
+        let exists = |name: &str| {
+            name == LOCAL_DESTINATION || raw.destinations.iter().any(|d| d.name() == name)
+        };
+        let default_destination = raw
+            .archive
+            .default_destination
+            .clone()
+            .unwrap_or_else(|| LOCAL_DESTINATION.to_string());
+        let mut names = HashSet::new();
+        let mut out = Vec::new();
+        for (i, p) in raw.policies.iter().enumerate() {
+            let label = match &p.name {
                 Some(name) => format!("policy {name:?}"),
                 None => {
                     self.error(format!("policy #{} needs a name", i + 1));
                     format!("policy #{}", i + 1)
                 }
             };
-            match policy.get("destination") {
-                None => {}
-                Some(toml::Value::String(name)) if exists(name) => {}
-                Some(toml::Value::String(name)) => {
-                    self.error(format!("{label}: no destination named {name:?}"))
+            let mut ok = true;
+            if let Some(name) = &p.name {
+                if !valid_grant_id(name) {
+                    ok = false;
+                    self.error(format!(
+                        "{label}: names may only contain letters, digits, '-', '_' and '.'"
+                    ));
+                } else if !names.insert(name.clone()) {
+                    ok = false;
+                    self.error(format!("{label} is defined more than once"));
                 }
-                Some(_) => self.error(format!("{label}: destination must be a string")),
             }
-            match policy.get("action").and_then(|v| v.as_str()) {
-                None | Some("propose") | Some("apply") => {}
-                Some(other) => self.error(format!(
-                    "{label}: action must be \"propose\" or \"apply\", not {other:?}"
-                )),
+            let destination = p.destination.clone().unwrap_or(default_destination.clone());
+            if !exists(&destination) {
+                ok = false;
+                self.error(format!("{label}: no destination named {destination:?}"));
+            }
+            let action = match p.action.as_deref() {
+                None | Some("propose") => PolicyAction::Propose,
+                Some("apply") => PolicyAction::Apply,
+                Some(other) => {
+                    ok = false;
+                    self.error(format!(
+                        "{label}: action must be \"propose\" or \"apply\", not {other:?}"
+                    ));
+                    PolicyAction::Propose
+                }
+            };
+            let mut duration = |field: &str, value: &Option<String>| -> Option<Duration> {
+                let v = value.as_deref()?;
+                match units::parse_duration(v) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        ok = false;
+                        self.error(format!("{label}: {field}: {e:#}"));
+                        None
+                    }
+                }
+            };
+            let wait = duration("wait", &p.wait).unwrap_or(DEFAULT_POLICY_WAIT);
+            let c = &p.conditions;
+            let grant_ended_for = duration("match.grant_ended_for", &c.grant_ended_for);
+            let unchanged_for = duration("match.unchanged_for", &c.unchanged_for);
+            let mut size = |field: &str, value: &Option<String>| -> Option<u64> {
+                let v = value.as_deref()?;
+                match units::parse_size(v) {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        ok = false;
+                        self.error(format!("{label}: {field}: {e:#}"));
+                        None
+                    }
+                }
+            };
+            let min_bytes = size("match.min_bytes", &c.min_bytes);
+            let max_avg_file_size = size("match.max_avg_file_size", &c.max_avg_file_size);
+            let policy_grants = match &c.grant {
+                None => Vec::new(),
+                Some(OneOrMany::One(g)) => vec![g.clone()],
+                Some(OneOrMany::Many(gs)) => gs.clone(),
+            };
+            for g in &policy_grants {
+                if !grants.iter().any(|known| &known.id == g) {
+                    ok = false;
+                    self.error(format!("{label}: match.grant: no grant {g:?}"));
+                }
+            }
+            let path = c.path.as_deref().and_then(|pattern| {
+                let expanded = match paths::expand(pattern) {
+                    Ok(p) => p.to_string_lossy().into_owned(),
+                    Err(e) => {
+                        self.error(format!("{label}: match.path: {e:#}"));
+                        return None;
+                    }
+                };
+                match globset::GlobBuilder::new(&expanded)
+                    .literal_separator(true)
+                    .build()
+                {
+                    Ok(_) if expanded.starts_with('/') => Some(expanded),
+                    Ok(_) => {
+                        self.error(format!(
+                            "{label}: match.path: {pattern:?} must be an absolute path or start with ~"
+                        ));
+                        None
+                    }
+                    Err(e) => {
+                        self.error(format!("{label}: match.path: {pattern:?}: {e}"));
+                        None
+                    }
+                }
+            });
+            if c.path.is_some() && path.is_none() {
+                ok = false;
+            }
+            let conditions = Conditions {
+                grants: policy_grants,
+                path,
+                grant_ended_for,
+                unchanged_for,
+                min_bytes,
+                min_files: c.min_files,
+                max_avg_file_size,
+            };
+            let any = !conditions.grants.is_empty()
+                || conditions.path.is_some()
+                || conditions.grant_ended_for.is_some()
+                || conditions.unchanged_for.is_some()
+                || conditions.min_bytes.is_some()
+                || conditions.min_files.is_some()
+                || conditions.max_avg_file_size.is_some();
+            if !any {
+                ok = false;
+                self.error(format!(
+                    "{label} has no conditions; add a match = {{ ... }} table"
+                ));
+            } else if action == PolicyAction::Apply
+                && c.grant_ended_for.is_none()
+                && c.unchanged_for.is_none()
+            {
+                ok = false;
+                self.error(format!(
+                    "{label}: action = \"apply\" needs match.grant_ended_for or match.unchanged_for, so only data nobody is changing is archived automatically"
+                ));
+            }
+            if ok && let Some(name) = &p.name {
+                out.push(Policy {
+                    name: name.clone(),
+                    conditions,
+                    action,
+                    destination,
+                    wait,
+                });
             }
         }
+        out
     }
 
     /// Checks values whose format TOML can't express.

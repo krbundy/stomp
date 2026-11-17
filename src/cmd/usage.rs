@@ -35,9 +35,8 @@ pub fn run(cfg: &Config, data_dir: &Path, format: Format, record: bool) -> Resul
             ));
         }
     }
-    let remote = open_catalog(data_dir)
-        .and_then(|c| c.archives())
-        .map(|archives| remote_holdings(&archives))
+    let (remote, proposals) = open_catalog(data_dir)
+        .and_then(|c| Ok((remote_holdings(&c.archives()?), c.open_proposal_count()?)))
         .unwrap_or_default();
     match format {
         Format::Table => print!(
@@ -52,6 +51,12 @@ pub fn run(cfg: &Config, data_dir: &Path, format: Format, record: bool) -> Resul
         ),
         Format::Csv => print!("{}", render_csv(&m)),
         Format::Json => println!("{}", serde_json::to_string_pretty(&m)?),
+    }
+    if proposals > 0 && matches!(format, Format::Table | Format::Md) {
+        println!(
+            "\n{proposals} director{} proposed for archiving; see `stomp candidates`.",
+            if proposals == 1 { "y is" } else { "ies are" }
+        );
     }
     Ok(())
 }

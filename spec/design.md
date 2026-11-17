@@ -1,9 +1,17 @@
 # stomp: Design Specification
 
-**Status:** Draft v0.6 (2026-11-17). Milestones M1 through M4 are implemented.
+**Status:** Draft v0.7 (2026-11-17). Milestones M1 through M5 are implemented.
 **Scope:** Behavior and architecture for the first releases. Open questions are listed in §24.
 
-**Changes since v0.5** (decisions made while building M4, remote destinations; details in §13.5):
+**Changes since v0.6** (decisions made while building M5, automation; details in §16.1 and §14.4):
+- **Proposals come only from grant data** unless a policy names a `path`, and never from hidden directories that way either (D29).
+- **"Unchanged" means neither modified nor changed** (mtime and ctime), so freshly copied or restored data isn't proposed straight away (D30).
+- **One small daily job** does the scheduled work; the weekly scan is a separate task it submits (D31).
+- **Automatic archiving waits** (7 days by default) after a directory is first proposed, needs an age condition, starts at most 3 archives a run, and checks each directory again first (D32).
+- **Scheduled runs open the catalog briefly**, like any command; long tasks still never do (D33).
+- Durations accept years (`1y` = 365 days).
+
+**Changes in v0.6** (decisions made while building M4, remote destinations; details in §13.5):
 - **S3 uses a small built-in client** (SigV4 over HTTPS), not the AWS SDK (D25, replacing D13).
 - **S3 integrity checks:** each request is signed with its body's SHA-256 and carries a Content-MD5, so the server checks both (D26).
 - **SFTP verification:** checked with `sha256sum` over SSH where the server allows it, and by reading the file back otherwise; `doctor` reports which applies (D27).
@@ -254,12 +262,13 @@ dirs  = ["~/project_beta", "~/project_beta_runs"]   # one grant, two directories
 name        = "archive-ended-grants"
 match       = { grant_ended_for = "90d" }
 action      = "propose"              # "propose" (default) | "apply"
-destination = "spaces"               # a destination name, or "local"
+destination = "spaces"               # a destination name, or "local" [default: archive.default_destination]
 
 [[policy]]
 name        = "pack-stale-small-files"
 match       = { unchanged_for = "180d", min_files = 10000, max_avg_file_size = "1MiB" }
-action      = "propose"
+action      = "apply"                # archived automatically by the daily run (§14.4)...
+wait        = "14d"                  # ...this long after first being proposed [default: 7d]
 destination = "local"
 ```
 
@@ -423,6 +432,7 @@ stomp creates all of these with mode `0700` or `0600`.
 
 - **SQLite is built into the binary** and uses rollback-journal mode, not WAL. WAL needs shared memory, which isn't reliable on a network filesystem.
 - **Neither tasks nor `stomp jobs log` ever write `catalog.db`.** They write self-contained files to `inbox/`. Tasks also keep a progress journal in `tasks/<id>/`.
+- **The scheduled daily run (§14.4) is the exception:** it opens the catalog like a command typed at the prompt, for the seconds its imports take (D33). Its heavy work, the weekly scan, is a separate task that follows the rule above.
 - **The next CLI command ingests the inbox** before doing anything else, holding an `flock` on `catalog.lock` while it does. `stomp ingest` does the same thing explicitly.
 - **`stomp tasks` shows live progress** by reading the task journals without changing them.
 
@@ -819,15 +829,28 @@ Finalized → upload README, SHA256SUMS, then the manifest last → Finished
 
 ### 14.4 Recurring work
 
-`stomp schedule enable` sets up recurring runs:
+`stomp schedule enable [--at HH:MM] [--mode scrontab|task]` sets up **one small daily job** (1 CPU, 2 GB, 30 minutes, with `[slurm]`'s partition and account) (D31). Each run:
 
-- It uses `scrontab` if the site enables it (Slurm 20.11 or later).
-- Otherwise it falls back to a task that resubmits itself with `--begin`.
-- **Default schedule:**
-  - **daily:** a usage sample and an accounting sync (`stomp jobs sync`); seconds of work.
-  - **weekly:** an incremental scan, followed by policy evaluation and checks on thawing restores.
+1. imports the inbox (finished scans, archive records, job logs);
+2. records a usage sample, if every root reports usage instantly (CephFS); otherwise measuring would mean walking every file, so it says so and skips it;
+3. imports job accounting (`stomp jobs sync`);
+4. submits a scan task when the last scan started 6½ days ago or more, or resumes one that stopped early, unless one is already queued or running;
+5. re-evaluates the policies against the newest detailed scan and estimates compression for new proposals (§16.1);
+6. archives proposals from `apply` policies whose wait has passed, at most 3 a run, each as its own archive task (D32);
+7. keeps the newest 30 run logs.
 
-`stomp schedule status` and `stomp schedule disable` manage it.
+**How it's scheduled:**
+
+- **`scrontab`**, if the site enables it (Slurm 20.11 or later). stomp adds a block between marker comments, with `#SCRON` option lines, and leaves the rest of the user's crontab alone.
+- **Otherwise, a job that queues the next one.** It's submitted with `sbatch --begin` for the chosen time. Each run queues its successor first, so a run that fails still keeps the chain going.
+- **The default time** is between 02:00 and 05:00, different for each user (from a hash of the user name), so colleagues' runs don't all start together.
+
+**Managing it:**
+
+- `stomp schedule status` shows the mode, the next queued run (in task mode), and the last run's outcome, line by line. It reports a problem if the scrontab entry or queued job is gone, or if no run has finished for over two days. `stomp doctor` reports the same problems.
+- `stomp schedule disable` removes the entry or cancels the queued job.
+- `stomp schedule run` does a run's work immediately.
+- State is kept in `schedule/state.json` and logs in `schedule/logs/` under the data directory.
 
 ## 15. Compute job attribution
 
@@ -914,12 +937,61 @@ TOTAL           516      21,426        624
 ## 16. Policies (automatic compression)
 
 - **Rules.** Policies are written in the config (§7.2). The available conditions are:
-  - `grant`, `path` (glob)
+  - `grant` (one ID or a list), `path` (glob)
   - `grant_ended_for`, `unchanged_for`
   - `min_bytes`, `min_files`, `max_avg_file_size`
-- **Evaluation.** Policies are evaluated after each scan. On Ceph they can also run between scans, using the live directory totals. The results are stored as **proposals**.
-- **Reviewing proposals.** `stomp candidates` lists proposals with the estimated space saved and reduction in file count. `stomp apply <proposal-id> | --all` carries them out.
-- **Defaults are safe.** The default action is `propose`, so nothing destructive happens automatically unless the user writes `action = "apply"` in a policy. When they do, stomp submits an archive task after the scan, and all the invariants in §12.4 still apply.
+- **Evaluation.** Policies are evaluated against the newest detailed scan, by `stomp candidates`, `stomp apply` and each scheduled run. The results are stored as **proposals**.
+- **Reviewing proposals.** `stomp candidates` lists proposals with the estimated space freed and the change in file count. `stomp apply <id>... | --all` carries them out, and `stomp candidates dismiss <id>...` stops proposing a directory.
+- **Defaults are safe.** The default action is `propose`, so nothing is archived automatically unless the user writes `action = "apply"` in a policy. When they do, the daily run (§14.4) submits archive tasks, and all the invariants in §12.4 still apply.
+
+### 16.1 As built (M5)
+
+**What a policy proposes.**
+
+- **Every condition must hold.** A policy proposes the *outermost* recorded directories that meet all of its conditions. When policies overlap, only the outermost proposal is kept, since archiving a directory covers everything in it. For the same directory, the first policy in the config wins.
+- **Grant data only (D29).** Without a `path`, only grant directories and directories inside them are proposed, and nothing under a hidden directory (a name starting with `.`).
+  - **Why:** software, settings and reference data are often read every day without being modified, so age alone mustn't put `~/bin`, `~/.conda` or a shared genome index up for archiving.
+  - **Other data:** a policy with a `path` glob can propose any directory the glob matches. `*` doesn't cross `/`, and `**` does.
+- **Never proposed:**
+  - roots
+  - directories that contain another grant's directory
+  - excluded directories (environments, caches, `scan.exclude`)
+  - stomp's data and staging directories, and anything containing them
+  - directories already archived or being archived, or that have gone since the scan
+- **Sizes leave out excluded directories.** Environments and caches inside a proposal stay in place when it's archived, so they don't count toward its size or its conditions.
+- **"Unchanged" uses both times (D30).** `unchanged_for` requires both the newest modification time (mtime) and the newest change time (ctime) to be older than the period.
+  - Copying, `rsync -a` and restoring keep old mtimes but set new ctimes, so data that has just arrived isn't proposed straight away.
+  - This is stricter than `stomp report stale`, which uses mtime alone.
+- **Grant end dates.** `grant_ended_for` compares the grant's `end` date in the config with today.
+
+**Proposals.**
+
+- **They're kept in the catalog** (`proposals` table, schema v4) with a stable numeric ID.
+- **Each evaluation updates the open ones.**
+  - New matches are added.
+  - Ones that no longer match are removed.
+  - The rest keep their ID and when they were first proposed.
+- **Applied and dismissed proposals are history.** They aren't proposed again, but `stomp apply <id>` still archives a dismissed one.
+- **Space freed.**
+  - For a remote destination, it's the whole size.
+  - For a local one, it's the size times one minus the estimated compression ratio.
+- **The estimate is cheap.** stomp compresses the first MiB of 16 files picked in proportion to size. The scan's per-directory sizes say where to look, so this reads little more than the samples.
+  - It's made for new proposals: up to 8 per `stomp candidates` run, and all of them in the daily run.
+  - It's made again when a proposal's size changes by more than 25%.
+- **Files after archiving** are the chunks (for a local archive) plus the six record files.
+
+**Applying.**
+
+- **Each proposal is checked again first.** The policy must still be in the config, and the directory must pass the archive checks (§12.4). Its grant and path conditions must still hold under the current config.
+- **On CephFS, nothing may have changed since the scan.** The live subtree totals and rctime must still meet the size and age conditions.
+- **A directory that fails is skipped with the reason.**
+- **Running it.** Each archive is its own Slurm task, or runs in the foreground one after another with `--here`.
+
+**Automatic archiving (D32).**
+
+- **An age condition is required.** A policy with `action = "apply"` must have `grant_ended_for` or `unchanged_for`.
+- **It waits.** A proposal is archived only `wait` (default 7 days) after it was first proposed, giving the user time to see it in `stomp candidates` and dismiss it. `stomp usage` mentions waiting proposals.
+- **It's capped.** The daily run starts at most 3 automatic archives, oldest proposals first, so a new policy doesn't flood the queue or the staging space.
 
 ## 17. Command-line interface
 
@@ -935,7 +1007,8 @@ TOTAL           516      21,426        624
 | `stomp changes [--since T] [--dirs] [--grant G] [--depth N] [--top N]` | Storage change tracking (§11) | foreground |
 | `stomp report <kind> [options] [--format table\|csv\|json\|md]` | Reports (§18) | foreground |
 | `stomp find [--grant G] [--largest N] [--older-than T] [--ext E]` | Find files and directories, using scan data | foreground |
-| `stomp candidates` / `stomp apply` | Review and carry out proposals (§16) | foreground / task |
+| `stomp candidates [--all]` / `stomp candidates dismiss <ID>...` | Review proposals, with estimated space freed and file counts (§16) | foreground |
+| `stomp apply <ID>... \| --all [--yes] [--here]` | Archive proposed directories, each checked again first (§16.1) | task |
 | `stomp archive <DIR> [--to local\|<dest>] [--dry-run] [--estimate] [--resume] [--level N] [--chunk-size S] [--yes] [--here]` | Archive a directory; `--dry-run` and `--estimate` only plan | task |
 | `stomp archives list\|show\|verify [--deep]` | Manage existing archives; `verify` checks remote chunks where they're stored | foreground |
 | `stomp archives move <ID> --to <DEST\|local> [--here] [--yes]` | Move an archive between its directory and destinations (§13.5) | task |
@@ -945,7 +1018,7 @@ TOTAL           516      21,426        624
 | `stomp jobs sync` | Import accounting records now; other commands do it when the last import is over 15 minutes old | foreground |
 | `stomp jobs retag <GRANT> <JOB>...` / `untag <JOB>...` | Fix attributions (§15.1) | foreground |
 | `stomp tasks [list\|show\|cancel]` | stomp's own background work (§14.3) | foreground |
-| `stomp schedule enable\|disable\|status` | Recurring work (§14.4) | foreground |
+| `stomp schedule enable [--at HH:MM] [--mode scrontab\|task]` / `disable` / `status` / `run` | The daily run (§14.4) | foreground / scheduled |
 | `stomp ingest` | Import the inbox (normally automatic) | foreground |
 | `stomp tui` | Interactive browser (later phase, §19) | foreground |
 
@@ -969,7 +1042,7 @@ The one exception is `stomp jobs log`, which always exits 0 unless `--strict` is
 | `history` | Per-grant storage (TB-months) and compute over time; optional cost estimates |
 | `grant <id>` | One grant's storage and compute together: directories, usage over time, age profile, top extensions, largest files, archives by destination, CPU and GPU hours by month. Suitable for a progress report or data management plan. |
 | `lifecycle` | Grants past their end date that still have data on the HPC or jobs logged to them; remote holdings by grant |
-| `stale [--older-than 180d] [--grant G] [--top N]` | The largest directories with no file modified within the period. Only the topmost stale directory of each subtree is listed, since everything inside it is stale too. Matching proposals arrive with policies (M5). |
+| `stale [--older-than 180d] [--grant G] [--top N]` | The largest directories with no file modified within the period. Only the topmost stale directory of each subtree is listed, since everything inside it is stale too. A policy with `unchanged_for` turns such directories into proposals (§16). |
 | `reclaimable` | Caches and software environments with suggested commands, such as `apptainer cache clean`, `conda clean --all`, or `apptainer build` to turn a sandbox into one SIF file |
 
 `stomp changes` (§11) prints in the same formats, so it isn't repeated as a report.
@@ -1067,7 +1140,7 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | **M2 Scan and compute** ✅ | walker, excluded directories, catalog and ingest, incremental scans, task submission, `tasks`, `changes`, **`jobs sync`, working-directory inference, `report compute`**, reports (`grant`, `stale`, `reclaimable`, `lifecycle`, `history` with TB-months). Deferred from M2: HTML reports, `track_files`, `jobs log --name`. | History, change tracking, finding stale data, compute per grant |
 | **M3 Local archive** ✅ | chunk format, manifests, the per-chunk steps and journal, invariants, `--estimate`, local restore, `archives list/show/verify` | Compression in place |
 | **M4 Remote destinations** ✅ | destination interface, SFTP, S3 (standard storage classes), verification methods, partial restore, `archives move` (which also covers the planned `push`), remote reports, destination checks in `doctor` | Moving data off the HPC |
-| **M5 Automation** | policies, `candidates` and `apply`, `schedule` | Hands-off upkeep |
+| **M5 Automation** ✅ | policies, `candidates` and `apply`, `schedule` | Hands-off upkeep |
 | **M6 Cold storage** (deferred) | S3 Glacier and Deep Archive: thaw requests, two-phase restores, cost estimates | Cheap long-term archives |
 | **M7 TUI** | Interactive browser | Convenience |
 
@@ -1103,6 +1176,11 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | D26 | Every S3 request is signed with its body's SHA-256 and carries a Content-MD5; objects record their SHA-256 | The server rejects anything damaged in transit, and `doctor` proves it does |
 | D27 | SFTP verification falls back automatically from `sha256sum` over SSH to reading back | Works with full-shell and SFTP-only servers without configuration |
 | D28 | Remote archives keep their records in the archived directory; only chunks leave | Listing, planning a restore and `show` work offline, and the directory explains itself |
+| D29 | Without a `path`, policies propose only grant data, and nothing hidden | Software, settings and reference data look "unchanged" but are used daily; the tool's purpose is grant data |
+| D30 | `unchanged_for` requires both mtime and ctime to be old | Copied, synced or restored data keeps old mtimes; it has just arrived and shouldn't be archived straight back |
+| D31 | One small daily job; the weekly scan is a task it submits | Short jobs start quickly; scans get the resources and checkpointing they need |
+| D32 | Automatic archiving needs an age condition, waits after the first proposal (7 days by default), checks again, and starts at most 3 a run | Time to notice and dismiss; nothing changing is archived; no queue floods |
+| D33 | The daily run writes the catalog briefly, like an interactive command | The usage sample and accounting import are seconds of work; routing them through the inbox would only add delay |
 
 ## 24. Open questions
 

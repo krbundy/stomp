@@ -75,7 +75,7 @@ pub fn parse_size(s: &str) -> Result<u64> {
     Ok(bytes.round() as u64)
 }
 
-/// Parses a duration such as `30d`, `1h` or `2w`.
+/// Parses a duration such as `30d`, `1h`, `2w` or `1y` (365 days).
 pub fn parse_duration(s: &str) -> Result<Duration> {
     let t = s.trim();
     let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
@@ -89,8 +89,9 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
         "h" => 3600,
         "d" => 86_400,
         "w" => 604_800,
-        "" => bail!("invalid duration {s:?}: add a unit (s, m, h, d or w)"),
-        other => bail!("invalid duration {s:?}: unknown unit {other:?} (use s, m, h, d or w)"),
+        "y" => 365 * 86_400,
+        "" => bail!("invalid duration {s:?}: add a unit (s, m, h, d, w or y)"),
+        other => bail!("invalid duration {s:?}: unknown unit {other:?} (use s, m, h, d, w or y)"),
     };
     let secs = n
         .checked_mul(seconds_per_unit)
@@ -185,7 +186,11 @@ mod tests {
         );
         assert!(parse_duration("30").is_err());
         assert!(parse_duration("d").is_err());
-        assert!(parse_duration("3y").is_err());
+        assert_eq!(
+            parse_duration("3y").unwrap(),
+            Duration::from_secs(3 * 365 * 86_400)
+        );
+        assert!(parse_duration("3mo").is_err());
     }
 
     #[test]

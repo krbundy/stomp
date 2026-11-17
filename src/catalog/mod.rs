@@ -6,10 +6,12 @@
 
 mod archives;
 mod compute;
+mod proposals;
 mod scans;
 
 pub use archives::CatalogArchive;
 pub use compute::JobTag;
+pub use proposals::{Proposal, ProposalSync};
 pub use scans::{ScanInfo, last_full_scan, latest_scan, scan_id};
 
 use std::fs::{File, OpenOptions};
@@ -23,7 +25,35 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::attribution::Measurement;
 use crate::paths;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+const SCHEMA_V4: &str = "
+BEGIN;
+CREATE TABLE proposals (
+    id               INTEGER PRIMARY KEY,
+    path             BLOB NOT NULL UNIQUE,
+    policy           TEXT NOT NULL,
+    action           TEXT NOT NULL,     -- 'propose' or 'apply'
+    grant_id         TEXT,
+    destination      TEXT NOT NULL,
+    bytes            INTEGER NOT NULL,  -- what would be archived
+    files            INTEGER NOT NULL,
+    kept_bytes       INTEGER NOT NULL,  -- excluded directories inside, which stay
+    newest           INTEGER,
+    reason           TEXT NOT NULL,
+    ratio            REAL,              -- estimated compressed size / size
+    ratio_bytes      INTEGER,           -- the size when the ratio was estimated
+    scan_id          INTEGER,
+    first_seen       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    state            TEXT NOT NULL,     -- 'open', 'applied' or 'dismissed'
+    task_id          TEXT,
+    archive_id       TEXT,
+    applied_at       INTEGER
+);
+PRAGMA user_version = 4;
+COMMIT;
+";
 
 const SCHEMA_V3: &str = "
 BEGIN;
@@ -248,6 +278,9 @@ impl Catalog {
         }
         if version < 3 {
             self.conn.execute_batch(SCHEMA_V3)?;
+        }
+        if version < 4 {
+            self.conn.execute_batch(SCHEMA_V4)?;
         }
         Ok(())
     }

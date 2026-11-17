@@ -56,6 +56,7 @@ pub fn run(config_path: &Path, data_dir: &Path, online: bool) -> Result<bool> {
     check_slurm(&mut r, config.as_ref());
     if let Some(cfg) = &config {
         check_destinations(&mut r, cfg, online);
+        check_policies(&mut r, cfg, data_dir);
     }
 
     println!();
@@ -358,5 +359,42 @@ fn check_destinations(r: &mut Report, cfg: &Config, online: bool) {
             "destinations",
             "checked from this node; `stomp doctor --submit` checks from a compute node",
         );
+    }
+}
+
+fn check_policies(r: &mut Report, cfg: &Config, data_dir: &Path) {
+    let scheduled = super::schedule::enabled(data_dir);
+    if let Some(problem) = super::schedule::health(data_dir) {
+        r.line(Status::Warn, "schedule", problem);
+    } else if scheduled {
+        r.line(Status::Pass, "schedule", "daily runs are on");
+    } else {
+        r.line(
+            Status::Info,
+            "schedule",
+            "daily runs are off; `stomp schedule enable` keeps usage, accounting, scans and proposals current",
+        );
+    }
+    if cfg.policies.is_empty() {
+        return;
+    }
+    let automatic = cfg
+        .policies
+        .iter()
+        .filter(|p| p.action == crate::config::PolicyAction::Apply)
+        .count();
+    let text = format!(
+        "{} polic{}, {automatic} archiving automatically",
+        cfg.policies.len(),
+        if cfg.policies.len() == 1 { "y" } else { "ies" }
+    );
+    if automatic > 0 && !scheduled {
+        r.line(
+            Status::Warn,
+            "policies",
+            format!("{text}, but nothing runs them until `stomp schedule enable`"),
+        );
+    } else {
+        r.line(Status::Pass, "policies", text);
     }
 }

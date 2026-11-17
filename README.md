@@ -5,7 +5,7 @@ admin help, and attributes your storage and Slurm jobs to the research grants
 that pay for them.
 
 The full design is in [`spec/design.md`](spec/design.md). Milestones M1 through
-M4 are done:
+M5 are done:
 
 | Command | What it does |
 |---------|--------------|
@@ -27,6 +27,9 @@ M4 are done:
 | `stomp archive DIR` | Packs a directory into compressed, verified chunks and removes the originals; `--to nas` sends the chunks to a destination |
 | `stomp archives` | Lists archives; `show`, `verify [--deep]` and `move --to DEST` |
 | `stomp restore ID` | Puts archived files back, all of them or `--only` some, downloading chunks as needed |
+| `stomp candidates` | Directories your policies propose to archive, with what archiving would free; `dismiss ID` |
+| `stomp apply ID...` | Archives proposed directories, each checked again first |
+| `stomp schedule enable` | A small daily Slurm job: usage, accounting, a weekly scan, proposals; `status`, `disable` |
 
 Data commands accept `--format table|csv|json|md`.
 
@@ -99,6 +102,58 @@ The archive's records stay in the directory, so `stomp archives show` and
 planning a restore work offline. If compute nodes can't reach a destination,
 archive locally in a task and then run `stomp archives move <ID> --to nas
 --here` on a login node.
+
+### Policies and the daily run
+
+Policies in the config propose directories to archive, based on the newest
+scan:
+
+```toml
+[[policy]]
+name  = "ended-grants"
+match = { grant_ended_for = "90d" }           # grant directories 90 days after the grant's end
+
+[[policy]]
+name   = "old-small-files"
+match  = { unchanged_for = "1y", min_files = 10000, max_avg_file_size = "1MiB" }
+action = "apply"                              # archive automatically (default: just propose)
+wait   = "14d"                                # ...two weeks after first proposing it
+```
+
+Conditions are `grant`, `path`, `grant_ended_for`, `unchanged_for`, `min_bytes`,
+`min_files` and `max_avg_file_size`; all of a policy's conditions must hold, and
+it proposes the outermost directories that meet them. Only data inside grant
+directories is proposed, and nothing hidden, unless a policy names a `path`:
+software and reference data can look untouched for years while being read
+every day.
+
+```sh
+stomp candidates                 # proposals, with the space each would free
+stomp candidates dismiss 4       # never propose that one again
+stomp apply 2 7                  # archive two of them, as Slurm tasks
+stomp schedule enable            # daily at a quiet hour, through scrontab if allowed
+stomp schedule status            # how the last run went
+```
+
+The daily run records a usage sample, imports job accounting, submits a scan
+once a week, updates the proposals, and archives those from `apply` policies
+once their wait has passed (at most three a day, each checked again first).
+
+### Trying it on your cluster
+
+`scripts/stomp-test.sbatch` measures what archiving would save on your own
+GeoTIFF and CSV files without touching them. It copies a random sample from
+the directories you name (5 GB of each type by default), then archives,
+verifies, restores and compares only the copies, using a separate stomp
+config so nothing shows up in your reports:
+
+```sh
+sbatch scripts/stomp-test.sbatch ~/carbon_mapping ~/soil
+LEVELS="3 9 19" SAMPLE_GB=10 sbatch scripts/stomp-test.sbatch ~/carbon_mapping
+```
+
+Results land in `stomp-test-<job>.out` (with a summary at the end) and
+`stomp-test-<job>.tsv`. The settings are described at the top of the script.
 
 ## Building
 

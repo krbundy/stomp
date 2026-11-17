@@ -13,6 +13,7 @@ pub mod dest;
 pub mod fs;
 pub mod jobs;
 pub mod paths;
+pub mod policy;
 pub mod scan;
 pub mod sys;
 pub mod table;

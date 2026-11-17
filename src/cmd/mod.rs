@@ -1,6 +1,7 @@
 //! Command implementations. Each module renders its own output.
 
 pub mod archive;
+pub mod candidates;
 pub mod changes;
 pub mod doctor;
 pub mod du;
@@ -9,6 +10,7 @@ pub mod jobs;
 pub mod progress;
 pub mod report;
 pub mod scan;
+pub mod schedule;
 pub mod tasks;
 pub mod usage;
 

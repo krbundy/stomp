@@ -50,6 +50,8 @@ enum Command {
         /// Skip connecting to destinations
         #[arg(long)]
         offline: bool,
+        #[arg(long, hide = true)]
+        task: Option<String>,
         #[command(flatten)]
         slurm: SlurmArgs,
     },
@@ -208,8 +210,81 @@ enum Command {
         #[command(flatten)]
         slurm: SlurmArgs,
     },
+    /// Directories your policies propose to archive
+    ///
+    /// Policies are [[policy]] blocks in the config, checked against the
+    /// newest scan. Each proposal shows its size and roughly what archiving
+    /// it would free.
+    Candidates {
+        #[command(subcommand)]
+        action: Option<CandidatesCommand>,
+        /// Also list proposals already applied or dismissed
+        #[arg(long)]
+        all: bool,
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// Archive directories proposed by `stomp candidates`
+    ///
+    /// Each proposal is checked again first: it must still exist and still
+    /// match its policy (on CephFS, nothing in it may have changed since the
+    /// scan). Each archive then runs as its own Slurm task.
+    Apply {
+        /// Proposal IDs, as `stomp candidates` lists them
+        ids: Vec<i64>,
+        /// Every open proposal
+        #[arg(long, conflicts_with = "ids")]
+        all: bool,
+        /// Don't ask for confirmation
+        #[arg(long, short)]
+        yes: bool,
+        /// Archive here, one after another, instead of submitting tasks
+        #[arg(long)]
+        here: bool,
+        #[command(flatten)]
+        slurm: SlurmArgs,
+    },
+    /// A daily run that keeps usage, accounting, scans and proposals current
+    #[command(subcommand)]
+    Schedule(ScheduleCommand),
     /// Import finished scans, job logs and archive records now (normally automatic)
     Ingest,
+}
+
+#[derive(Subcommand)]
+enum CandidatesCommand {
+    /// Stop proposing these directories
+    Dismiss {
+        #[arg(required = true)]
+        ids: Vec<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommand {
+    /// Run stomp daily, through scrontab or a job that queues the next one
+    ///
+    /// Each run is a small, short Slurm job: it records a usage sample,
+    /// imports job accounting, submits a scan task once a week, updates the
+    /// archive proposals, and archives those from "apply" policies once their
+    /// wait has passed. Running it again changes the time.
+    Enable {
+        /// Time of day, HH:MM [default: a time between 02:00 and 05:00, different for each user]
+        #[arg(long, value_name = "HH:MM")]
+        at: Option<String>,
+        /// How runs are scheduled [default: scrontab if the site allows it]
+        #[arg(long, value_enum)]
+        mode: Option<cmd::schedule::Mode>,
+    },
+    /// Stop the daily runs
+    Disable,
+    /// How the daily runs are set up, and how the last one went
+    Status,
+    /// Do a scheduled run's work now
+    Run {
+        #[arg(long, hide = true)]
+        chain: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -473,6 +548,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Doctor {
             submit,
             offline,
+            task,
             slurm,
         } => {
             if submit {
@@ -492,7 +568,27 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 );
                 return Ok(ExitCode::SUCCESS);
             }
+            if let Some(id) = &task {
+                crate::tasks::update(&data_dir, id, |s| s.status = crate::tasks::Status::Running)?;
+            }
             let ok = cmd::doctor::run(&config_path, &data_dir, !offline)?;
+            if let Some(id) = &task {
+                crate::tasks::update(&data_dir, id, |s| {
+                    s.status = if ok {
+                        crate::tasks::Status::Done
+                    } else {
+                        crate::tasks::Status::Failed
+                    };
+                    s.message = Some(
+                        if ok {
+                            "all checks passed"
+                        } else {
+                            "some checks failed; see the log"
+                        }
+                        .into(),
+                    );
+                })?;
+            }
             return Ok(if ok {
                 ExitCode::SUCCESS
             } else {
@@ -755,6 +851,60 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             };
             return cmd::archive::restore(&cfg, &config_path, &data_dir, args);
         }
+        Command::Candidates {
+            action,
+            all,
+            format: f,
+        } => {
+            let cfg = load_config(&config_path)?;
+            match action {
+                None => cmd::candidates::list(
+                    &cfg,
+                    &data_dir,
+                    &cmd::candidates::ListArgs {
+                        all,
+                        format: format(f),
+                    },
+                )?,
+                Some(CandidatesCommand::Dismiss { ids }) => {
+                    cmd::candidates::dismiss(&cfg, &data_dir, &ids)?
+                }
+            }
+        }
+        Command::Apply {
+            ids,
+            all,
+            yes,
+            here,
+            slurm,
+        } => {
+            let cfg = load_config(&config_path)?;
+            start_threads(Some(&cfg));
+            let args = cmd::candidates::ApplyArgs {
+                ids,
+                all,
+                yes,
+                here,
+                overrides: slurm.overrides(),
+            };
+            return cmd::candidates::apply(&cfg, &config_path, &data_dir, args);
+        }
+        Command::Schedule(action) => match action {
+            ScheduleCommand::Enable { at, mode } => cmd::schedule::enable(
+                &load_config(&config_path)?,
+                &config_path,
+                &data_dir,
+                at.as_deref(),
+                mode,
+            )?,
+            ScheduleCommand::Disable => cmd::schedule::disable(&data_dir)?,
+            ScheduleCommand::Status => return cmd::schedule::status(&data_dir),
+            ScheduleCommand::Run { chain } => {
+                let cfg = load_config(&config_path)?;
+                start_threads(Some(&cfg));
+                return cmd::schedule::run(&cfg, &config_path, &data_dir, chain);
+            }
+        },
         Command::Ingest => {
             let catalog = cmd::open_catalog(&data_dir)?;
             println!(
