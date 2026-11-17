@@ -28,6 +28,7 @@ use super::manifest::{
 };
 use super::plan::{self, PlanEntry};
 use super::{ArchiveRecord, NOTE_FILE, Settings, archive_path};
+use crate::dest::Destination;
 use crate::fs::Backend;
 use crate::scan::rules::Rules;
 
@@ -84,15 +85,25 @@ pub fn ctime_ns(md: &fs::Metadata) -> i64 {
 }
 
 /// Archives `settings.source`, or continues an archive started earlier.
+/// `dest` is the destination named in the settings, for remote archives.
+#[allow(clippy::too_many_arguments)]
 pub fn archive(
     settings: &Settings,
     rules: &Rules,
     backend: &dyn Backend,
+    dest: Option<&dyn Destination>,
     data_dir: &Path,
     stop: &AtomicBool,
     progress: &Progress,
     hook: Hook,
 ) -> Result<Outcome> {
+    if settings.is_remote() != dest.is_some() {
+        bail!(
+            "archive {} is stored at {:?}, but no matching destination was given",
+            settings.id,
+            settings.destination
+        );
+    }
     let started = Instant::now();
     let dir = archive_path(&settings.source, &settings.id);
     crate::paths::create_private_dir(&dir)?;
@@ -119,6 +130,7 @@ pub fn archive(
         progress,
         hook,
         data_dir,
+        dest,
     };
     let result = run.go(rules, backend);
     let summary = run.summary(started)?;
@@ -142,6 +154,7 @@ struct Run<'a> {
     progress: &'a Progress,
     hook: Hook<'a>,
     data_dir: &'a Path,
+    dest: Option<&'a dyn Destination>,
 }
 
 enum Added {
@@ -175,6 +188,24 @@ impl Run<'_> {
         self.manifest_dir().join(format!("chunk-{k:04}.kept.jsonl"))
     }
 
+    fn chunk_dir(&self) -> PathBuf {
+        self.settings.chunk_dir(&self.dir)
+    }
+
+    fn chunk_path(&self, k: u32) -> PathBuf {
+        self.chunk_dir().join(manifest::chunk_name(k))
+    }
+
+    /// Where a file of this archive goes at its destination.
+    fn remote_rel(&self, name: &str) -> String {
+        format!("{}/{name}", self.settings.remote_prefix())
+    }
+
+    fn remote_location(&self) -> Option<String> {
+        self.dest
+            .map(|d| d.location(&self.settings.remote_prefix()))
+    }
+
     fn go(&mut self, rules: &Rules, backend: &dyn Backend) -> Result<()> {
         if self.state.planned.is_none() {
             let s = self.settings;
@@ -202,6 +233,21 @@ impl Run<'_> {
         }
         if self.state.finished.is_none() {
             let header = self.finalize(chunks)?;
+            // The manifest goes last: a remote archive without one is unfinished (§12.4).
+            if let Some(dest) = self.dest
+                && !self.state.metadata_uploaded
+            {
+                for name in [manifest::README, manifest::CHECKSUMS, manifest::MANIFEST] {
+                    let path = self.dir.join(name);
+                    dest.put(
+                        &path,
+                        &self.remote_rel(name),
+                        &manifest::sha256_file(&path)?,
+                        &self.dir,
+                    )?;
+                }
+                self.step(Event::MetadataUploaded)?;
+            }
             self.journal.append(&mut self.state, Event::Finished)?;
             self.send_record("complete", Some(&header))?;
         }
@@ -229,7 +275,7 @@ impl Run<'_> {
         if !self.state.chunk(k).verified {
             let sha = self.state.chunk(k).written.expect("written").0;
             let records = entry_records(&self.records_path(k))?;
-            let chunk_path = self.dir.join(manifest::chunk_name(k));
+            let chunk_path = self.chunk_path(k);
             if let Err(e) = verify_chunk(&chunk_path, &sha, &records, true) {
                 // Never delete anything on the strength of a bad chunk: discard it and stop.
                 let _ = fs::remove_file(&chunk_path);
@@ -245,6 +291,24 @@ impl Run<'_> {
                 )));
             }
             self.step(Event::Verified { chunk: k })?;
+        }
+        if let Some(dest) = self.dest {
+            // I1: originals go only once the chunk is verified where it will stay.
+            if !self.state.chunk(k).uploaded {
+                let sha = self.state.chunk(k).written.expect("written").0;
+                dest.put(
+                    &self.chunk_path(k),
+                    &self.remote_rel(&manifest::chunk_name(k)),
+                    &sha,
+                    &self.chunk_dir(),
+                )?;
+                self.step(Event::Uploaded { chunk: k })?;
+            }
+            match fs::remove_file(self.chunk_path(k)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         self.step(Event::Deleting { chunk: k })?;
         let (removed, kept, missing) = self.delete_chunk(k)?;
@@ -262,9 +326,10 @@ impl Run<'_> {
     fn write_chunk(&mut self, k: u32) -> Result<(String, u64, u64, u64)> {
         let entries = plan::load_chunk(&self.dir, k)?;
         fs::create_dir_all(self.manifest_dir())?;
-        let final_path = self.dir.join(manifest::chunk_name(k));
+        crate::paths::create_private_dir(&self.chunk_dir())?;
+        let final_path = self.chunk_path(k);
         let partial = self
-            .dir
+            .chunk_dir()
             .join(format!("{}.partial", manifest::chunk_name(k)));
         let file = File::create(&partial)?;
         let mut encoder = zstd::Encoder::new(
@@ -303,7 +368,7 @@ impl Run<'_> {
             .sync_all()?;
         manifest::write_jsonl(&self.records_path(k), lines)?;
         fs::rename(&partial, &final_path)?;
-        manifest::sync_dir(&self.dir)?;
+        manifest::sync_dir(&self.chunk_dir())?;
         Ok((sha256, compressed, files, bytes))
     }
 
@@ -441,8 +506,21 @@ impl Run<'_> {
         Ok((removed, kept))
     }
 
-    /// Writes the manifest, checksums, README and note, and tidies the work files.
+    /// Writes the manifest, checksums, README and note once (journaled), then
+    /// tidies the work files. Safe to repeat after an interruption.
     fn finalize(&mut self, chunks: u32) -> Result<Header> {
+        if !self.state.finalized {
+            self.write_final_files(chunks)?;
+            self.step(Event::Finalized)?;
+        }
+        if self.manifest_dir().exists() {
+            fs::remove_dir_all(self.manifest_dir())?;
+        }
+        plan::remove(&self.dir)?;
+        manifest::read_header(&self.dir.join(manifest::MANIFEST))
+    }
+
+    fn write_final_files(&mut self, chunks: u32) -> Result<()> {
         let mut kept: HashSet<PathBuf> = HashSet::new();
         for k in 1..=chunks {
             let path = self.kept_path(k);
@@ -505,6 +583,8 @@ impl Run<'_> {
             zstd_level: s.level,
             chunk_size: s.chunk_size,
             totals,
+            destination: Some(s.destination.clone()),
+            location: self.remote_location(),
         };
 
         // Second pass: the manifest itself, header first, then entries, then what was left in place.
@@ -551,15 +631,12 @@ impl Run<'_> {
             out.write_all(checksums.as_bytes())?;
             Ok(())
         })?;
-        let readme = manifest::readme_text(&header);
+        let readme = manifest::readme_text(&header, header.location.as_deref());
         manifest::write_atomic(&self.dir.join(manifest::README), |out| {
             out.write_all(readme.as_bytes())?;
             Ok(())
         })?;
-        self.write_note(Some(&header))?;
-        fs::remove_dir_all(self.manifest_dir())?;
-        plan::remove(&self.dir)?;
-        Ok(header)
+        self.write_note(Some(&header))
     }
 
     fn write_note(&self, finished: Option<&Header>) -> Result<()> {
@@ -574,6 +651,7 @@ impl Run<'_> {
             &created,
             crate::sys::user_name().as_deref(),
             finished,
+            self.remote_location().as_deref(),
         );
         manifest::write_atomic(&self.settings.source.join(NOTE_FILE), |out| {
             out.write_all(text.as_bytes())?;
@@ -588,8 +666,10 @@ impl Run<'_> {
             id: s.id.clone(),
             source: s.source.to_string_lossy().into_owned(),
             grant: s.grant.clone(),
-            destination: "local".into(),
-            location: self.dir.to_string_lossy().into_owned(),
+            destination: s.destination.clone(),
+            location: self
+                .remote_location()
+                .unwrap_or_else(|| self.dir.to_string_lossy().into_owned()),
             state: state.into(),
             created_at: self.state.created_at.clone(),
             finished_at: header.map(|h| h.finished_at.clone()),

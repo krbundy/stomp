@@ -2,7 +2,7 @@
 //! the next begins, so a killed run resumes exactly where it stopped and never
 //! repeats a destructive step.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -47,9 +47,26 @@ pub enum Event {
         removed: u64,
         kept: u64,
     },
+    /// A chunk is stored and verified at the archive's destination.
+    Uploaded {
+        chunk: u32,
+    },
+    /// The manifest, checksums, README and note are written.
+    Finalized,
+    /// The manifest, checksums and README are stored at the destination.
+    MetadataUploaded,
     Finished,
     /// Everything was restored and the archive's files removed.
     Restored,
+    /// While moving to `to` (a destination or `local`): this chunk is there and verified.
+    Moved {
+        chunk: u32,
+        to: String,
+    },
+    /// Every chunk and the metadata are at `to`.
+    MoveFinished {
+        to: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,6 +81,7 @@ pub struct ChunkState {
     /// (sha256, compressed bytes, files, bytes)
     pub written: Option<(String, u64, u64, u64)>,
     pub verified: bool,
+    pub uploaded: bool,
     pub deleting: bool,
     pub deleted: Option<(u64, u64, u64)>,
 }
@@ -76,8 +94,13 @@ pub struct JournalState {
     pub planned: Option<(u32, u64, u64)>,
     pub chunks: BTreeMap<u32, ChunkState>,
     pub dirs_removed: Option<(u64, u64)>,
+    pub finalized: bool,
+    pub metadata_uploaded: bool,
     pub finished: Option<String>,
     pub restored: bool,
+    /// Chunks already moved, by target.
+    pub moved: BTreeMap<String, BTreeSet<u32>>,
+    pub moves_finished: BTreeSet<String>,
 }
 
 impl JournalState {
@@ -113,9 +136,23 @@ impl JournalState {
                 missing,
             } => self.chunks.entry(*chunk).or_default().deleted = Some((*removed, *kept, *missing)),
             Event::DirsRemoved { removed, kept } => self.dirs_removed = Some((*removed, *kept)),
+            Event::Uploaded { chunk } => self.chunks.entry(*chunk).or_default().uploaded = true,
+            Event::Finalized => self.finalized = true,
+            Event::MetadataUploaded => self.metadata_uploaded = true,
             Event::Finished => self.finished = Some(at.to_string()),
             Event::Restored => self.restored = true,
+            Event::Moved { chunk, to } => {
+                self.moved.entry(to.clone()).or_default().insert(*chunk);
+            }
+            Event::MoveFinished { to } => {
+                self.moves_finished.insert(to.clone());
+            }
         }
+    }
+
+    /// Whether chunk `k` has already been moved to `to`.
+    pub fn is_moved(&self, k: u32, to: &str) -> bool {
+        self.moved.get(to).is_some_and(|set| set.contains(&k))
     }
 
     pub fn chunk(&self, k: u32) -> ChunkState {

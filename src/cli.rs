@@ -42,8 +42,17 @@ enum Command {
         #[arg(long)]
         print: bool,
     },
-    /// Check stomp's configuration and environment
-    Doctor,
+    /// Check stomp's configuration, environment and destinations
+    Doctor {
+        /// Run the checks in a Slurm task, to see what compute nodes can reach
+        #[arg(long)]
+        submit: bool,
+        /// Skip connecting to destinations
+        #[arg(long)]
+        offline: bool,
+        #[command(flatten)]
+        slurm: SlurmArgs,
+    },
     /// Show current storage use per grant
     Usage {
         #[arg(long, value_enum, default_value_t = Format::Table)]
@@ -124,7 +133,7 @@ enum Command {
     Archive {
         /// The directory to archive
         dir: PathBuf,
-        /// Where to keep the archive: local (in the directory itself)
+        /// Where the chunks go: local (inside the directory) or a configured destination [default: archive.default_destination]
         #[arg(long, value_name = "DEST")]
         to: Option<String>,
         /// Don't ask for confirmation
@@ -185,6 +194,9 @@ enum Command {
         /// Keep the archive even after restoring everything
         #[arg(long)]
         keep_archive: bool,
+        /// After restoring everything, also delete the copy at the destination (kept by default)
+        #[arg(long)]
+        delete_remote: bool,
         /// Don't ask for confirmation
         #[arg(long, short)]
         yes: bool,
@@ -209,13 +221,35 @@ enum ArchivesCommand {
         /// Archive ID, or the archived directory
         archive: String,
     },
-    /// Check an archive's checksums
+    /// Check an archive's checksums, wherever its chunks are
     Verify {
         /// Archive ID, or the archived directory
         archive: String,
-        /// Also decompress every chunk and check each file's checksum
+        /// Also decompress every chunk and check each file's checksum (downloads remote chunks)
         #[arg(long)]
         deep: bool,
+    },
+    /// Move an archive's chunks to a destination, or back into its directory with --to local
+    ///
+    /// Each chunk is verified at the new place before any copy is removed.
+    /// If compute nodes can't reach the destination, use --here on a login
+    /// or data-transfer node.
+    Move {
+        /// Archive ID, or the archived directory
+        archive: String,
+        /// A configured destination, or local
+        #[arg(long, value_name = "DEST")]
+        to: String,
+        /// Don't ask for confirmation
+        #[arg(long, short)]
+        yes: bool,
+        /// Run here instead of submitting a Slurm task
+        #[arg(long)]
+        here: bool,
+        #[arg(long, hide = true)]
+        task: Option<String>,
+        #[command(flatten)]
+        slurm: SlurmArgs,
     },
 }
 
@@ -436,8 +470,29 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             start_threads(None);
             cmd::init::run(&config_path, &roots, print)?;
         }
-        Command::Doctor => {
-            let ok = cmd::doctor::run(&config_path, &data_dir)?;
+        Command::Doctor {
+            submit,
+            offline,
+            slurm,
+        } => {
+            if submit {
+                let cfg = load_config(&config_path)?;
+                let state = crate::tasks::submit(
+                    &cfg,
+                    &config_path,
+                    &data_dir,
+                    "doctor",
+                    &["doctor".to_string()],
+                    &slurm.overrides(),
+                )?;
+                println!(
+                    "Submitted the checks as Slurm job {}. When it finishes, `stomp tasks show {}` points to the output.",
+                    state.slurm_jobs.first().map_or("?", String::as_str),
+                    state.id
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            let ok = cmd::doctor::run(&config_path, &data_dir, !offline)?;
             return Ok(if ok {
                 ExitCode::SUCCESS
             } else {
@@ -642,7 +697,35 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             None | Some(ArchivesCommand::List) => cmd::archive::list(&data_dir, format(f))?,
             Some(ArchivesCommand::Show { archive }) => cmd::archive::show(&data_dir, &archive)?,
             Some(ArchivesCommand::Verify { archive, deep }) => {
-                return cmd::archive::verify(&data_dir, &archive, deep);
+                return cmd::archive::verify(
+                    &load_config(&config_path)?,
+                    &data_dir,
+                    &archive,
+                    deep,
+                );
+            }
+            Some(ArchivesCommand::Move {
+                archive,
+                to,
+                yes,
+                here,
+                task,
+                slurm,
+            }) => {
+                let args = cmd::archive::MoveArgs {
+                    what: archive,
+                    to,
+                    yes,
+                    here,
+                    task,
+                    overrides: slurm.overrides(),
+                };
+                return cmd::archive::move_archive(
+                    &load_config(&config_path)?,
+                    &config_path,
+                    &data_dir,
+                    args,
+                );
             }
         },
         Command::Restore {
@@ -651,6 +734,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             to,
             overwrite,
             keep_archive,
+            delete_remote,
             yes,
             here,
             task,
@@ -663,6 +747,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 to,
                 overwrite,
                 keep_archive,
+                delete_remote,
                 yes,
                 here,
                 task,

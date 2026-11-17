@@ -4,13 +4,13 @@ A storage management utility for HPC users. stomp runs as you, with no root or
 admin help, and attributes your storage and Slurm jobs to the research grants
 that pay for them.
 
-The full design is in [`spec/design.md`](spec/design.md). Milestones M1, M2
-and M3 are done:
+The full design is in [`spec/design.md`](spec/design.md). Milestones M1 through
+M4 are done:
 
 | Command | What it does |
 |---------|--------------|
 | `stomp init` | Writes a starter config listing your top-level directories |
-| `stomp doctor` | Checks the config and environment |
+| `stomp doctor` | Checks the config, environment and each destination |
 | `stomp usage` | Storage per grant, instant on CephFS; each run is saved to the history |
 | `stomp du [DIR] [-d N]` | Directory sizes with the grant each one belongs to |
 | `stomp scan` | Submits a Slurm task that scans in detail: data ages, file types, environments, caches |
@@ -24,9 +24,9 @@ and M3 are done:
 | `stomp report stale` | Big directories nothing has touched in 180 days |
 | `stomp report reclaimable` | Caches and environments, with commands to slim them down |
 | `stomp report lifecycle` | Grants that have ended or are about to, and what they still use |
-| `stomp archive DIR` | Packs a directory into compressed, verified chunks and removes the originals |
-| `stomp archives` | Lists archives; `show` and `verify [--deep]` |
-| `stomp restore ID` | Puts archived files back, all of them or `--only` some |
+| `stomp archive DIR` | Packs a directory into compressed, verified chunks and removes the originals; `--to nas` sends the chunks to a destination |
+| `stomp archives` | Lists archives; `show`, `verify [--deep]` and `move --to DEST` |
+| `stomp restore ID` | Puts archived files back, all of them or `--only` some, downloading chunks as needed |
 
 Data commands accept `--format table|csv|json|md`.
 
@@ -63,6 +63,42 @@ owned by other people stay in place.
 
 Every archive includes a `README.txt` explaining how to restore it with just
 `sha256sum`, `zstd` and `tar`. The archive never depends on stomp.
+
+### Destinations
+
+Chunks can go to an SFTP server (such as a NAS) or to S3-compatible storage
+(such as DigitalOcean Spaces) instead of staying in the directory:
+
+```toml
+[[destination]]
+name = "nas"
+type = "sftp"
+host = "nas"                    # anything `sftp` accepts, including ~/.ssh/config aliases
+path = "/archive/$USER"
+
+[[destination]]
+name = "spaces"
+type = "s3"
+endpoint = "https://nyc3.digitaloceanspaces.com"
+bucket = "lab-archives"
+profile = "spaces"              # keys under [spaces] in ~/.aws/credentials
+```
+
+```sh
+stomp doctor                                   # logs in, writes a test file, checks how uploads are verified
+stomp doctor --submit                          # the same from a compute node
+stomp archive ~/project/runs_2023 --to nas     # chunks go to the NAS
+stomp archives move <ID> --to spaces           # move an existing archive (or --to local)
+stomp restore <ID>                             # downloads what it needs; the remote copy is kept
+```
+
+Each chunk is verified at the destination before any original file is
+removed: with `sha256sum` over SSH (or by reading it back on SFTP-only
+servers), and on S3 by the server checking every request's SHA-256 and MD5.
+The archive's records stay in the directory, so `stomp archives show` and
+planning a restore work offline. If compute nodes can't reach a destination,
+archive locally in a task and then run `stomp archives move <ID> --to nas
+--here` on a login node.
 
 ## Building
 

@@ -9,6 +9,7 @@ pub mod cli;
 pub mod cmd;
 pub mod compute;
 pub mod config;
+pub mod dest;
 pub mod fs;
 pub mod jobs;
 pub mod paths;

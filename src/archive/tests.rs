@@ -157,10 +157,90 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, Node> {
     out
 }
 
+/// A destination that is just a local directory, with failures on demand.
+pub(crate) struct DirDest {
+    root: PathBuf,
+    /// Paths whose next upload fails.
+    fail_next: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl DirDest {
+    fn new(root: PathBuf) -> DirDest {
+        fs::create_dir_all(&root).unwrap();
+        DirDest {
+            root,
+            fail_next: Default::default(),
+        }
+    }
+
+    fn files(&self) -> Vec<String> {
+        let mut out: Vec<String> = walk(&self.root)
+            .into_iter()
+            .filter(|p| p.is_file())
+            .map(|p| {
+                p.strip_prefix(&self.root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+impl crate::dest::Destination for DirDest {
+    fn name(&self) -> &str {
+        "store"
+    }
+    fn kind(&self) -> &'static str {
+        "test"
+    }
+    fn location(&self, rel: &str) -> String {
+        format!("store:{rel}")
+    }
+    fn put(&self, local: &Path, rel: &str, sha256: &str, _: &Path) -> anyhow::Result<()> {
+        if self.fail_next.lock().unwrap().remove(rel) {
+            anyhow::bail!("upload of {rel} failed (test)");
+        }
+        let target = self.root.join(rel);
+        fs::create_dir_all(target.parent().unwrap())?;
+        fs::copy(local, &target)?;
+        anyhow::ensure!(manifest::sha256_file(&target)? == sha256, "bad copy");
+        Ok(())
+    }
+    fn verify(&self, rel: &str, sha256: &str, _: u64, _: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            manifest::sha256_file(&self.root.join(rel))? == sha256,
+            "mismatch"
+        );
+        Ok(())
+    }
+    fn get(&self, rel: &str, local: &Path) -> anyhow::Result<()> {
+        fs::copy(self.root.join(rel), local)?;
+        Ok(())
+    }
+    fn delete(&self, rel: &str) -> anyhow::Result<()> {
+        let _ = fs::remove_file(self.root.join(rel));
+        Ok(())
+    }
+    fn delete_dir(&self, rel: &str) -> anyhow::Result<()> {
+        let _ = fs::remove_dir(self.root.join(rel));
+        Ok(())
+    }
+    fn list(&self, _: &str) -> anyhow::Result<Vec<(String, u64)>> {
+        Ok(Vec::new())
+    }
+    fn check(&self) -> Vec<crate::dest::Check> {
+        Vec::new()
+    }
+}
+
 struct Fixture {
     _tmp: tempfile::TempDir,
     base: PathBuf,
     source: PathBuf,
+    remote: Option<DirDest>,
 }
 
 impl Fixture {
@@ -173,7 +253,21 @@ impl Fixture {
             _tmp: tmp,
             base,
             source,
+            remote: None,
         }
+    }
+
+    /// A fixture whose archives go to a remote destination.
+    fn remote() -> Fixture {
+        let mut f = Fixture::new();
+        f.remote = Some(DirDest::new(f.base.join("remote")));
+        f
+    }
+
+    fn dest(&self) -> Option<&dyn crate::dest::Destination> {
+        self.remote
+            .as_ref()
+            .map(|d| d as &dyn crate::dest::Destination)
     }
 
     fn data(&self) -> PathBuf {
@@ -189,6 +283,13 @@ impl Fixture {
             level: 3,
             threads: 1,
             only_owned: true,
+            destination: if self.remote.is_some() {
+                "store"
+            } else {
+                "local"
+            }
+            .into(),
+            staging: self.remote.as_ref().map(|_| self.base.join("staging")),
         }
     }
 
@@ -203,6 +304,7 @@ impl Fixture {
             &self.settings(),
             &rules,
             &PosixBackend,
+            self.dest(),
             &self.data(),
             &AtomicBool::new(false),
             &Progress::default(),
@@ -226,6 +328,7 @@ impl Fixture {
             &self.archive_dir(),
             &self.source,
             options,
+            self.dest(),
             &self.data(),
             &AtomicBool::new(false),
         )
@@ -350,9 +453,20 @@ fn leaves_environments_excluded_and_special_files_in_place() {
 
 #[test]
 fn every_crash_point_resumes_without_losing_data() {
+    crash_everywhere(Fixture::new);
+}
+
+#[test]
+fn every_crash_point_of_a_remote_archive_resumes_without_losing_data() {
+    crash_everywhere(Fixture::remote);
+}
+
+/// Stops an archive after each journaled step in turn, resumes it, restores
+/// it, and checks that every file came back exactly.
+fn crash_everywhere(make: fn() -> Fixture) {
     // Count the journaled steps of an uninterrupted run.
     let steps = {
-        let f = Fixture::new();
+        let f = make();
         let count = AtomicUsize::new(0);
         f.archive_with(&|_| {
             count.fetch_add(1, Ordering::SeqCst);
@@ -364,7 +478,7 @@ fn every_crash_point_resumes_without_losing_data() {
     assert!(steps >= 10, "expected many steps, got {steps}");
 
     for stop_at in 1..=steps {
-        let f = Fixture::new();
+        let f = make();
         let before = snapshot(&f.source);
         let count = AtomicUsize::new(0);
         let first = f
@@ -384,6 +498,7 @@ fn every_crash_point_resumes_without_losing_data() {
                 &f.archive_dir(),
                 &f.source,
                 &options,
+                f.dest(),
                 &f.data(),
                 &AtomicBool::new(false),
             );
@@ -559,4 +674,124 @@ fn estimate_reflects_compressibility() {
     assert!(e.sampled_files > 0);
     assert!(e.ratio < 0.9, "test data compresses, got {}", e.ratio);
     assert_eq!(e.files_after, u64::from(plan.summary.chunks) + 6);
+}
+
+#[test]
+fn remote_archive_round_trip() {
+    let f = Fixture::remote();
+    let before = snapshot(&f.source);
+    let summary = f.archive();
+    let remote = f.remote.as_ref().unwrap();
+    let files = remote.files();
+    let chunks = files.iter().filter(|p| p.contains("chunk-")).count();
+    assert_eq!(chunks as u32, summary.chunks);
+    for name in [manifest::MANIFEST, manifest::CHECKSUMS, manifest::README] {
+        assert!(
+            files.contains(&format!("T/T-20261117-000001/{name}")),
+            "{name} not uploaded: {files:?}"
+        );
+    }
+    // Only the records stay local; no chunk is left on disk or in staging.
+    let dir = f.archive_dir();
+    assert!(dir.join(manifest::MANIFEST).exists());
+    assert!(
+        !walk(&dir)
+            .iter()
+            .any(|p| p.to_string_lossy().contains("chunk-"))
+    );
+    assert!(!walk(&f.base.join("staging")).iter().any(|p| p.is_file()));
+    assert!(
+        fs::read_to_string(f.source.join(NOTE_FILE))
+            .unwrap()
+            .contains("store:T/T-20261117-000001")
+    );
+    let readme = fs::read_to_string(dir.join(manifest::README)).unwrap();
+    assert!(
+        readme.contains("Download every file from store:"),
+        "{readme}"
+    );
+
+    // Restoring downloads the chunks; the remote copy stays unless asked.
+    let restored = f.restore(&RestoreOptions::default());
+    assert!(restored.archive_removed);
+    assert_eq!(snapshot(&f.source), before);
+    assert_eq!(remote.files().len(), files.len(), "the remote copy is kept");
+}
+
+#[test]
+fn restore_can_delete_the_remote_copy() {
+    let f = Fixture::remote();
+    f.archive();
+    f.restore(&RestoreOptions {
+        delete_remote: true,
+        ..RestoreOptions::default()
+    });
+    assert!(f.remote.as_ref().unwrap().files().is_empty());
+}
+
+#[test]
+fn a_failed_upload_deletes_nothing() {
+    let f = Fixture::remote();
+    let before = snapshot(&f.source);
+    f.remote
+        .as_ref()
+        .unwrap()
+        .fail_next
+        .lock()
+        .unwrap()
+        .insert("T/T-20261117-000001/chunk-0001.tar.zst".into());
+    assert!(f.archive_with(&|_| false).is_err());
+    assert_eq!(
+        snapshot(&f.source),
+        before,
+        "nothing may be deleted before the upload is verified"
+    );
+    f.archive();
+    f.restore(&RestoreOptions::default());
+    assert_eq!(snapshot(&f.source), before);
+}
+
+#[test]
+fn archives_move_between_local_and_remote() {
+    let mut f = Fixture::new();
+    let before = snapshot(&f.source);
+    f.archive();
+    let remote = DirDest::new(f.base.join("remote"));
+    let dir = f.archive_dir();
+    let stop = AtomicBool::new(false);
+
+    // Out to the remote destination...
+    let out = relocate(&dir, None, Some(&remote), &f.data(), &stop).unwrap();
+    assert!(matches!(out, RelocateOutcome::Complete(at) if at == "store:T/T-20261117-000001"));
+    assert!(
+        !walk(&dir)
+            .iter()
+            .any(|p| p.to_string_lossy().contains("chunk-"))
+    );
+    assert!(
+        remote
+            .files()
+            .iter()
+            .any(|p| p.ends_with("chunk-0001.tar.zst"))
+    );
+    assert_eq!(load_settings(&dir).unwrap().destination, "store");
+    assert!(
+        relocate(&dir, Some(&remote), Some(&remote), &f.data(), &stop).is_err(),
+        "already there"
+    );
+
+    // ...and back again.
+    relocate(&dir, Some(&remote), None, &f.data(), &stop).unwrap();
+    assert!(
+        remote.files().is_empty(),
+        "the remote copy is removed after the move"
+    );
+    assert!(dir.join(manifest::chunk_name(1)).exists());
+    assert_eq!(load_settings(&dir).unwrap().destination, "local");
+
+    // Out once more, then restore straight from the remote.
+    relocate(&dir, None, Some(&remote), &f.data(), &stop).unwrap();
+    f.remote = Some(remote);
+    f.restore(&RestoreOptions::default());
+    assert_eq!(snapshot(&f.source), before);
 }

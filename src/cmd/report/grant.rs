@@ -30,6 +30,7 @@ struct Report {
     storage: Option<Storage>,
     storage_by_month: Vec<MonthStorage>,
     scan: Option<ScanSection>,
+    archives: Vec<crate::catalog::CatalogArchive>,
     compute_by_month: Vec<MonthCompute>,
 }
 
@@ -266,6 +267,11 @@ pub fn grant(cfg: &Config, data_dir: &Path, id: &str, format: Format) -> Result<
             .map(|(month, bytes)| MonthStorage { month, bytes })
             .collect(),
         scan,
+        archives: catalog
+            .archives()?
+            .into_iter()
+            .filter(|a| a.grant.as_deref() == Some(id))
+            .collect(),
         compute_by_month: compute.into_values().collect(),
     };
     match format {
@@ -441,6 +447,33 @@ fn render(r: &Report) -> Document {
                 "No scan yet; run `stomp scan` for age profiles, file types and largest files.",
             );
         }
+    }
+
+    if !r.archives.is_empty() {
+        doc.heading("Archives");
+        let mut t = Table::new(&[
+            ("ARCHIVE", Align::Left),
+            ("WHERE", Align::Left),
+            ("STATE", Align::Left),
+            ("ORIGINAL", Align::Right),
+            ("STORED", Align::Right),
+            ("DIRECTORY", Align::Left),
+        ]);
+        for a in &r.archives {
+            t.row(vec![
+                a.id.clone(),
+                a.destination.clone(),
+                a.state.clone(),
+                format_bytes(a.bytes),
+                if a.compressed > 0 {
+                    format_bytes(a.compressed)
+                } else {
+                    "—".into()
+                },
+                paths::display(Path::new(&a.source)),
+            ]);
+        }
+        doc.table(t);
     }
 
     doc.heading("Compute by month");

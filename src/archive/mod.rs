@@ -1,11 +1,12 @@
 //! Archiving (§12 of the spec): packing a directory into verified, compressed
 //! chunks, removing the originals, and restoring them.
 //!
-//! A local archive lives inside the directory it came from:
+//! An archive's records live inside the directory it came from, and so do its
+//! chunks unless they were sent to a remote destination (§13):
 //!
 //! ```text
 //! <dir>/STOMP_ARCHIVED.txt
-//! <dir>/.stomp-archive/<id>/chunk-0001.tar.zst ...
+//! <dir>/.stomp-archive/<id>/chunk-0001.tar.zst ...     (local archives only)
 //!                          manifest.jsonl.zst  SHA256SUMS  README.txt  journal.jsonl
 //! ```
 
@@ -13,6 +14,7 @@ mod estimate;
 pub mod journal;
 pub mod manifest;
 pub mod plan;
+mod relocate;
 mod restore;
 mod write;
 
@@ -25,10 +27,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub use estimate::{Estimate, estimate};
+pub use relocate::{RelocateOutcome, relocate};
 pub use restore::{RestoreOptions, RestoreOutcome, RestoreSummary, restore};
 pub use write::{Hook, Outcome, Progress, Summary, archive, entry_records, verify_chunk};
 
-use crate::config::Config;
+use crate::config::{Config, LOCAL_DESTINATION};
 use crate::paths;
 use crate::scan::rules::Rules;
 
@@ -46,6 +49,43 @@ pub struct Settings {
     pub level: i32,
     pub threads: u32,
     pub only_owned: bool,
+    /// `local`, or the destination holding the chunks (§13).
+    #[serde(default = "local")]
+    pub destination: String,
+    /// Where chunks are written before upload; by default the archive directory.
+    #[serde(default)]
+    pub staging: Option<PathBuf>,
+}
+
+fn local() -> String {
+    LOCAL_DESTINATION.to_string()
+}
+
+impl Settings {
+    pub fn is_remote(&self) -> bool {
+        self.destination != LOCAL_DESTINATION
+    }
+
+    /// The archive's directory at a destination: `<grant>/<id>`.
+    pub fn remote_prefix(&self) -> String {
+        crate::dest::archive_prefix(self.grant.as_deref(), &self.id)
+    }
+
+    /// Where chunk files are written or downloaded to.
+    pub fn chunk_dir(&self, archive_dir: &Path) -> PathBuf {
+        match &self.staging {
+            Some(staging) if self.is_remote() => staging.join(&self.id),
+            _ => archive_dir.to_path_buf(),
+        }
+    }
+}
+
+/// Rewrites saved settings, e.g. after an archive moves to another destination.
+pub fn update_settings(archive_dir: &Path, settings: &Settings) -> Result<()> {
+    manifest::write_atomic(&archive_dir.join("settings.json"), |out| {
+        serde_json::to_writer_pretty(out, settings)?;
+        Ok(())
+    })
 }
 
 pub fn archive_path(source: &Path, id: &str) -> PathBuf {

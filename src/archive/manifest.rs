@@ -247,6 +247,12 @@ pub struct Header {
     pub zstd_level: i32,
     pub chunk_size: u64,
     pub totals: Totals,
+    /// Where the chunks were stored when the archive was made (`local` or a destination).
+    #[serde(default)]
+    pub destination: Option<String>,
+    /// For a remote archive, where its files are.
+    #[serde(default)]
+    pub location: Option<String>,
 }
 
 pub enum Record {
@@ -435,14 +441,37 @@ fn friendly_time(rfc3339: &str) -> String {
     }
 }
 
-/// The README kept with every archive, explaining how to restore it with standard tools.
-pub fn readme_text(header: &Header) -> String {
+/// Reads the header of a finished manifest.
+pub fn read_header(path: &Path) -> Result<Header> {
+    for line in open_lines(path)?.lines() {
+        if let Record::Header(h) = parse_record(&line?)? {
+            return Ok(*h);
+        }
+    }
+    bail!("{} has no header", path.display())
+}
+
+/// The README kept with every archive, explaining how to restore it with
+/// standard tools. `location` is where the chunks are, if not alongside.
+pub fn readme_text(header: &Header, location: Option<&str>) -> String {
+    let local_dir = shell_quote(&format!(
+        "{}/{}/{}",
+        header.source,
+        super::ARCHIVE_DIR,
+        header.archive_id
+    ));
+    let fetch = match location {
+        None => format!("    cd {local_dir}\n"),
+        Some(at) => format!(
+            "    # Download every file from {at} into one directory, for example\n    # with sftp or an S3 client, and change into it. Then:\n"
+        ),
+    };
     format!(
         "This is a stomp archive of {source}.
 
 Archive ID: {id}
 Created:    {created} by {user} on {host}
-Contents:   {files} files ({bytes}), in {chunks} chunk(s)
+Contents:   {files} files ({bytes}), in {chunks} chunk(s){stored}
 
 Each chunk-NNNN.tar.zst is an ordinary tar file compressed with zstd. Paths
 inside are relative to the archived directory. manifest.jsonl.zst lists every
@@ -454,8 +483,7 @@ To restore with stomp:
 
 To restore without stomp, using sha256sum, zstd and tar:
 
-    cd {archive_dir}
-    sha256sum -c SHA256SUMS
+{fetch}    sha256sum -c SHA256SUMS
     for c in chunk-*.tar.zst; do zstd -dc \"$c\" | tar -x -C {source_q}; done
 
 To list what's inside:
@@ -470,33 +498,35 @@ To list what's inside:
         files = format_count(header.totals.files),
         bytes = format_bytes(header.totals.bytes),
         chunks = header.totals.chunks,
-        archive_dir = shell_quote(&format!(
-            "{}/{}/{}",
-            header.source,
-            super::ARCHIVE_DIR,
-            header.archive_id
-        )),
+        stored = location.map_or(String::new(), |at| format!("\nStored at:  {at}")),
         source_q = shell_quote(&header.source),
     )
 }
 
-/// The note left in an archived directory (§12.1).
+/// The note left in an archived directory (§12.1). `remote` is where the
+/// chunks are, for an archive stored at a destination.
 pub fn note_text(
     id: &str,
     source: &Path,
     created: &str,
     user: Option<&str>,
     finished: Option<&Header>,
+    remote: Option<&str>,
 ) -> String {
-    let location = format!("{}/{id}", super::ARCHIVE_DIR);
+    let records = format!("{}/{id}", super::ARCHIVE_DIR);
+    let location = match remote {
+        Some(at) => format!("{at}\n           (records in {records}, inside this directory)"),
+        None => format!("{records} (inside this directory)"),
+    };
     let created = friendly_time(created);
     let mut text = match finished {
         None => format!(
             "This directory is being archived by stomp (archive {id}), started {created} by {user}.
 
-Files are packed into compressed chunks in {location} and the originals are
-removed one chunk at a time, after each chunk has been verified. If archiving
-stops partway, everything already removed is safe in those chunks.
+Files are packed into compressed chunks ({location}) and the
+originals are removed one chunk at a time, after each chunk has been verified
+where it is stored. If archiving stops partway, everything already removed is
+safe in those chunks.
 
 To continue:            stomp archive --resume {dir}
 To put everything back: stomp restore {id}
@@ -508,7 +538,7 @@ To put everything back: stomp restore {id}
             "This directory was archived by stomp on {created} by {user}.
 
 Archive:   {id}
-Location:  {location} (inside this directory)
+Location:  {location}
 Contents:  {files} files ({bytes}), compressed to {compressed} in {chunks} chunk(s)
 
 The originals were packed into compressed tar files and removed.
@@ -517,7 +547,7 @@ To restore with stomp:
 
     stomp restore {id}
 
-To restore without stomp, see {location}/README.txt.
+To restore without stomp, see {records}/README.txt.
 ",
             user = user.unwrap_or("unknown"),
             files = format_count(h.totals.files),

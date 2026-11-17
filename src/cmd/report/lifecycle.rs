@@ -26,6 +26,8 @@ struct Row {
     status: String,
     days: Option<i64>,
     storage_bytes: Option<u64>,
+    /// Stored size of archives held at remote destinations.
+    archived_remote_bytes: u64,
     jobs_after_end: u64,
     cpu_hours_after_end: f64,
 }
@@ -45,6 +47,10 @@ pub fn lifecycle(cfg: &Config, data_dir: &Path, format: Format) -> Result<()> {
     };
     let attributor = Attributor::new(cfg, catalog.tags()?);
     let jobs = catalog.jobs_in_range(None, None)?;
+    let mut remote: HashMap<String, u64> = HashMap::new();
+    for h in crate::cmd::usage::remote_holdings(&catalog.archives()?) {
+        *remote.entry(h.grant).or_default() += h.compressed;
+    }
 
     let mut rows: Vec<Row> = cfg
         .grants
@@ -81,6 +87,7 @@ pub fn lifecycle(cfg: &Config, data_dir: &Path, format: Format) -> Result<()> {
                 status,
                 days,
                 storage_bytes: storage.get(&g.id).map(|v| v.0),
+                archived_remote_bytes: remote.get(&g.id).copied().unwrap_or(0),
                 jobs_after_end: jobs_after,
                 cpu_hours_after_end: cpu_after,
             }
@@ -108,6 +115,7 @@ pub fn lifecycle(cfg: &Config, data_dir: &Path, format: Format) -> Result<()> {
             ("ENDS", Align::Left),
             ("STATUS", Align::Left),
             ("STORAGE ON HPC", Align::Right),
+            ("ARCHIVED ELSEWHERE", Align::Right),
             ("JOBS AFTER END", Align::Right),
             ("CPU-H AFTER END", Align::Right),
         ]);
@@ -118,6 +126,11 @@ pub fn lifecycle(cfg: &Config, data_dir: &Path, format: Format) -> Result<()> {
                 r.end.clone().unwrap_or_else(|| "—".into()),
                 r.status.clone(),
                 r.storage_bytes.map_or("—".into(), format_bytes),
+                if r.archived_remote_bytes > 0 {
+                    format_bytes(r.archived_remote_bytes)
+                } else {
+                    "—".into()
+                },
                 if after {
                     r.jobs_after_end.to_string()
                 } else {

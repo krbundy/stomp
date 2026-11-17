@@ -1,9 +1,17 @@
 # stomp: Design Specification
 
-**Status:** Draft v0.5 (2026-11-17). Milestones M1, M2 and M3 are implemented.
+**Status:** Draft v0.6 (2026-11-17). Milestones M1 through M4 are implemented.
 **Scope:** Behavior and architecture for the first releases. Open questions are listed in §24.
 
-**Changes since v0.4** (decisions made while building M3, local archiving):
+**Changes since v0.5** (decisions made while building M4, remote destinations; details in §13.5):
+- **S3 uses a small built-in client** (SigV4 over HTTPS), not the AWS SDK (D25, replacing D13).
+- **S3 integrity checks:** each request is signed with its body's SHA-256 and carries a Content-MD5, so the server checks both (D26).
+- **SFTP verification:** checked with `sha256sum` over SSH where the server allows it, and by reading the file back otherwise; `doctor` reports which applies (D27).
+- **`archives push` folds into `archives move`**, run with `--here` on a login node.
+- **What stays local:** a remote archive keeps its records (manifest, checksums, README, journal) in the directory; only the chunks leave (D28).
+- **Restoring keeps the remote copy** unless `--delete-remote` is given.
+
+**Changes in v0.5** (decisions made while building M3, local archiving):
 - §12.6 records how archiving was built: what's refused, the fixed plan, verification, deletion and restore details.
 - **The plan is fixed when archiving starts**, so files created afterwards stay in place (D21).
 - **Deletion is two-phase**, and hard links are checked without ctime (D22).
@@ -705,10 +713,88 @@ Spaces is the first S3 service stomp targets, because the user already keeps dat
 
 A destination that works from a login node may not work from a compute node. For example, AWS endpoints need outbound internet access, which many clusters block on compute nodes.
 
-- `stomp doctor --submit` runs the destination checks in a short task on a compute node.
-- If a destination can't be reached from compute nodes, its transfer steps run separately from compression:
-  - the task compresses and verifies the chunks locally,
-  - then `stomp archives push <id>` uploads them from a login or data-transfer node, after a warning. This step mostly waits on the network rather than the CPU.
+- `stomp doctor --submit` runs the checks, destinations included, in a short task on a compute node.
+- If a destination can't be reached from compute nodes, the work splits in two:
+  1. Archive locally in a task (`stomp archive DIR --to local`).
+  2. From a login or data-transfer node, run `stomp archives move <ID> --to <destination> --here`. This step mostly waits on the network rather than the CPU.
+
+### 13.5 As built (M4)
+
+#### The destination interface
+
+Every destination provides:
+- `put`: upload and verify; a file exists at the destination only once it is complete and correct
+- `verify`
+- `get`
+- `delete` and `delete_dir`
+- `list`
+- `check`, the self-test that `stomp doctor` runs
+
+Every destination uses the same layout: `<base>/<grant or "unassigned">/<archive id>/`.
+
+#### Remote archives
+
+For each chunk:
+
+```
+WRITE → VERIFY (fully decompressed) → UPLOAD (put, verified at the destination)
+      → remove the local chunk → DELETE originals
+```
+
+Then:
+
+```
+Finalized → upload README, SHA256SUMS, then the manifest last → Finished
+```
+
+- **Where chunks are written:** `general.staging_dir/<id>` if it's set, otherwise the archive directory.
+- **What stays local:** the archive's records (manifest, SHA256SUMS, README, settings, journal) stay in `<dir>/.stomp-archive/<id>`. Listing, planning restores, and `show` never need the network (D28).
+- **The note and README** say where the chunks are, and how to fetch them and restore without stomp.
+
+#### S3 (D25, D26)
+
+- **The client:** SigV4-signed requests over HTTPS (ureq with rustls). Signing is tested against AWS's published examples.
+- **Credentials:** read from `AWS_*` environment variables when no profile is given, otherwise from the named profile in `~/.aws/credentials` or `~/.aws/config`.
+- **Retries:** network errors, `429` and `5xx` (including `503 SlowDown`) are retried with backoff.
+- **Small and large uploads:**
+  - A chunk no larger than the part size goes up with a single `PUT`.
+  - Larger chunks use a multipart upload: parts of max(64 MiB, size/9000), uploaded in parallel (`parallel_uploads`).
+  - The upload ID is kept in a `.upload` file beside the local chunk. An interrupted upload asks the server which parts it already has, and resends only the missing or mismatched ones.
+- **Integrity checks:**
+  - **Every request body is checked by the server twice.** Its SHA-256 is part of the signature, and a Content-MD5 header is sent too.
+  - **The object records its own checksum.** It carries `x-amz-meta-stomp-sha256`.
+  - **What each `verify` mode checks after the upload:**
+    - `server-checksum` (default): the object's size and that recorded checksum.
+    - `readback`: downloads the object and hashes it.
+    - `size`: the size alone.
+- **What `stomp doctor` checks:** it uploads a test object, then sends deliberately wrong checksums. If the server accepts both while `verify = "server-checksum"`, that's a failure, with advice to use `readback`.
+- **Avoiding SDK checksum problems:** stomp never sends `x-amz-checksum-*` headers or chunked (`aws-chunked`) uploads, so the SDK checksum problems some S3-compatible services have (§13.3.7) don't arise.
+
+#### SFTP (D27)
+
+- **Batch mode:** stomp runs `sftp -b -` and `ssh`, both with `BatchMode=yes`.
+- **Uploads:** each file goes to `<file>.partial`, is verified, then renamed into place.
+- **Verification:** `verify` defaults to automatic: `sha256sum` over SSH, and if the server refuses commands, reading the file back. Setting `remote-sha256` makes a refusal an error; `size` checks the size alone.
+- **Interrupted uploads start over.** A `.partial` file is always rewritten, which is simple and safe.
+- **One stream:** each upload uses a single SFTP stream; `parallel_uploads` applies to S3 only.
+- **Testing:** commands and output parsing are tested against stand-in `sftp`/`ssh` programs. Behavior against a real OpenSSH server, such as quoting edge cases, is still to be confirmed on the NAS.
+
+#### Restore
+
+- Chunks that aren't on disk are downloaded into the staging location, verified, extracted, and deleted.
+- After a complete restore, the remote copy is kept and the archive is recorded as `restored-copy-kept`, unless `--delete-remote` is given.
+
+#### Moving archives
+
+- `stomp archives move <ID> --to <destination|local>` moves an archive between its directory and a destination, or between two destinations.
+- Each chunk is copied and verified at the new place, and journaled as `Moved`, before any copy of it is removed.
+- The metadata goes next. The old location is cleared last, and only then are the saved settings updated. Interrupted moves resume.
+
+#### Reports
+
+- `stomp usage` lists what's archived elsewhere, by destination and grant.
+- `stomp report grant` lists the grant's archives.
+- `stomp report lifecycle` shows how much each grant has archived elsewhere.
 
 ## 14. Slurm integration (stomp's own tasks)
 
@@ -842,7 +928,7 @@ TOTAL           516      21,426        624
 | Command | Purpose | Runs |
 |---------|---------|------|
 | `stomp init` | Create a config from the detected layout | foreground |
-| `stomp doctor [--submit]` | Check the environment: backend, quota, Slurm, `sacct`, scrontab, each destination (login, verification method, credential expiry), catalog size. `--submit` repeats the destination checks from a compute node. | foreground / task |
+| `stomp doctor [--submit] [--offline]` | Check the environment: backend, quota, Slurm, `sacct`, scrontab, catalog size, and each destination (login, writing, verification method, whether the server enforces checksums). `--submit` runs the checks from a compute node; `--offline` skips the destinations. | foreground / task |
 | `stomp usage [--grant G] [--root R]` | Current storage use by grant (§8.4) | foreground |
 | `stomp du [PATH] [--depth N]` | Directory tree with sizes; instant on Ceph | foreground |
 | `stomp scan [--full] [--resume] [--here] [--time --cpus --mem --partition --account]` | Detailed scan; the Slurm options override `[slurm]` for this task | task |
@@ -851,8 +937,9 @@ TOTAL           516      21,426        624
 | `stomp find [--grant G] [--largest N] [--older-than T] [--ext E]` | Find files and directories, using scan data | foreground |
 | `stomp candidates` / `stomp apply` | Review and carry out proposals (§16) | foreground / task |
 | `stomp archive <DIR> [--to local\|<dest>] [--dry-run] [--estimate] [--resume] [--level N] [--chunk-size S] [--yes] [--here]` | Archive a directory; `--dry-run` and `--estimate` only plan | task |
-| `stomp archives list\|show\|verify [--deep]\|move\|push` | Manage existing archives (`move` and `push` arrive with M4) | mixed |
-| `stomp restore <ID\|DIR> [--only PATTERN]... [--to DIR] [--overwrite] [--keep-archive] [--yes] [--here]` | Restore (§12.5); resumable by running it again | task |
+| `stomp archives list\|show\|verify [--deep]` | Manage existing archives; `verify` checks remote chunks where they're stored | foreground |
+| `stomp archives move <ID> --to <DEST\|local> [--here] [--yes]` | Move an archive between its directory and destinations (§13.5) | task |
+| `stomp restore <ID\|DIR> [--only PATTERN]... [--to DIR] [--overwrite] [--keep-archive] [--delete-remote] [--yes] [--here]` | Restore (§12.5); resumable by running it again | task |
 | `stomp jobs log <GRANT> [--job ID]... [--name GLOB --since T] [--note TEXT] [--strict]` | Attribute compute jobs to a grant (§15.1) | instant |
 | `stomp jobs list [--grant G \| --unassigned] [--since T] [--no-sync]` | Compute jobs with their grant and usage | foreground |
 | `stomp jobs sync` | Import accounting records now; other commands do it when the last import is over 15 minutes old | foreground |
@@ -929,7 +1016,7 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | Catalog | `rusqlite` (bundled SQLite) |
 | Archives | `tar`, `zstd` (multithreaded), `blake3`, `sha2` |
 | Filesystem | `xattr`, `rustix` (statfs, statx), `rayon` or a custom work-stealing walker |
-| S3 (`s3` feature) | `aws-config`, `aws-sdk-s3` using rustls; the `tokio` runtime is used only inside `dest::s3`, and the rest of stomp stays synchronous |
+| S3 | A built-in SigV4 client over `ureq` (rustls), with `md-5` for Content-MD5 (D25) |
 | Dates and durations | `jiff` |
 | Errors and logging | `thiserror`, `anyhow`, `tracing` |
 | Progress output | `indicatif` |
@@ -938,7 +1025,7 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 ### 20.3 Build and distribution
 
 - Built as a static binary for `x86_64-unknown-linux-musl`, so it doesn't depend on the cluster's glibc version. aarch64 can be added if needed.
-- Users copy one file into `~/bin`. A build without the `s3` feature is available for users who want a smaller binary.
+- Users copy one file into `~/bin`.
 - **External programs are needed only for the features that use them:** OpenSSH `ssh`/`sftp` for SFTP destinations, and Slurm's `sbatch`, `squeue`, `sacct` and `scrontab` for tasks and compute attribution.
 
 ## 21. Testing
@@ -979,7 +1066,7 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | **M1 Usage** ✅ | config, `init`, `doctor`, storage attribution, `usage`, `du`, usage samples, basic CSV and table report, **`stomp jobs log`** (writes records to the inbox only) | Per-grant storage numbers immediately; job tags start accumulating |
 | **M2 Scan and compute** ✅ | walker, excluded directories, catalog and ingest, incremental scans, task submission, `tasks`, `changes`, **`jobs sync`, working-directory inference, `report compute`**, reports (`grant`, `stale`, `reclaimable`, `lifecycle`, `history` with TB-months). Deferred from M2: HTML reports, `track_files`, `jobs log --name`. | History, change tracking, finding stale data, compute per grant |
 | **M3 Local archive** ✅ | chunk format, manifests, the per-chunk steps and journal, invariants, `--estimate`, local restore, `archives list/show/verify` | Compression in place |
-| **M4 Remote destinations** | destination interface, SFTP, S3 (standard storage classes), verification methods, partial restore, `archives move` and `archives push`, remote reports | Moving data off the HPC |
+| **M4 Remote destinations** ✅ | destination interface, SFTP, S3 (standard storage classes), verification methods, partial restore, `archives move` (which also covers the planned `push`), remote reports, destination checks in `doctor` | Moving data off the HPC |
 | **M5 Automation** | policies, `candidates` and `apply`, `schedule` | Hands-off upkeep |
 | **M6 Cold storage** (deferred) | S3 Glacier and Deep Archive: thaw requests, two-phase restores, cost estimates | Cheap long-term archives |
 | **M7 TUI** | Interactive browser | Convenience |
@@ -1000,7 +1087,7 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | D10 | Files owned by other users are skipped by default | Never delete a collaborator's files in a shared directory |
 | D11 | Environments and caches are counted in usage but never scanned or archived | Sandboxes hold millions of files that can be rebuilt; caches can be cleaned instead |
 | D12 | Destinations are a named list of pluggable types (`sftp`, `s3`) | One archive format and one restore path; users can keep several destinations |
-| D13 | S3 through the embedded AWS SDK, behind a feature that is on by default | Reads existing AWS config and credentials natively; supports checksums, resumable multipart uploads and thaw requests; no extra programs |
+| D13 | *(Replaced by D25.)* S3 through the embedded AWS SDK | — |
 | D14 | Compute jobs are attributed by explicit log first, then by working directory | Most jobs are attributed with no effort, explicit logging overrides it, and history can be filled in from `sacct` |
 | D15 | `stomp jobs log` never fails the user's job | A tracking tool must never cost someone a compute run |
 | D16 | Accounting records are copied into the catalog | Sites purge old `sacct` records |
@@ -1012,12 +1099,16 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | D22 | Deletion checks every original in a chunk before removing any; hard links are checked without ctime | Removing one hard link changes the shared inode's ctime, which would otherwise make the other links look modified |
 | D23 | Before deleting originals, each chunk is fully decompressed and every file's BLAKE3 compared | Verifying the chunk's SHA-256 alone would only prove the chunk wasn't damaged after writing, not that it holds the right data |
 | D24 | A restore treats files whose size and mtime match as already restored | An interrupted restore can be rerun without reporting its own work as conflicts |
+| D25 | S3 through a small built-in SigV4 client, not the AWS SDK | Synchronous like the rest of stomp; a small static binary; never sends the SDK's default checksum headers, which some S3-compatible services reject; full control over retries and multipart resume. The cost: no AWS SSO or assume-role, which Spaces doesn't need. Revisit for Glacier (M6). |
+| D26 | Every S3 request is signed with its body's SHA-256 and carries a Content-MD5; objects record their SHA-256 | The server rejects anything damaged in transit, and `doctor` proves it does |
+| D27 | SFTP verification falls back automatically from `sha256sum` over SSH to reading back | Works with full-shell and SFTP-only servers without configuration |
+| D28 | Remote archives keep their records in the archived directory; only chunks leave | Listing, planning a restore and `show` work offline, and the directory explains itself |
 
 ## 24. Open questions
 
-- **Q1. NAS access:** can we run commands on the NAS over SSH, or is it SFTP-only?
-  - This sets the default for `verify` on the NAS destination. Shell access allows `remote-sha256`; SFTP-only means `readback`.
-  - Also needed: the NAS hostname and base path, whether the NAS has a quota, and whether the NAS is itself backed up. After archiving, the NAS copy is the only copy.
+- **Q1. NAS access:** stomp now handles both cases (D27), and `stomp doctor` reports which applies.
+  - Still to confirm: the NAS hostname and base path, whether the NAS has a quota, and whether the NAS is itself backed up. After archiving, the NAS copy is the only copy.
+  - Also to confirm: that the `sftp` batch commands behave as tested against real OpenSSH (§13.5).
 - **Q2. "File management" scope:** this draft covers `du`, `find`, reclaimable caches and moving directories between grants (by editing the config). Are deleting, moving or deduplicating files also wanted?
 - **Q3. CPU architecture:** the cluster's `uname -m` output. x86_64 is assumed.
 - **Q5. Accounting fields:** does the site record GPUs and billing units in `AllocTRES`? Check with `sacct -X -S now-7days -o JobID,AllocTRES%80 | head`.

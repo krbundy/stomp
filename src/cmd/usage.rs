@@ -35,9 +35,21 @@ pub fn run(cfg: &Config, data_dir: &Path, format: Format, record: bool) -> Resul
             ));
         }
     }
+    let remote = open_catalog(data_dir)
+        .and_then(|c| c.archives())
+        .map(|archives| remote_holdings(&archives))
+        .unwrap_or_default();
     match format {
-        Format::Table => print!("{}", render_table(cfg, &m, false)),
-        Format::Md => print!("{}", render_table(cfg, &m, true)),
+        Format::Table => print!(
+            "{}{}",
+            render_table(cfg, &m, false),
+            remote_table(&remote, false)
+        ),
+        Format::Md => print!(
+            "{}{}",
+            render_table(cfg, &m, true),
+            remote_table(&remote, true)
+        ),
         Format::Csv => print!("{}", render_csv(&m)),
         Format::Json => println!("{}", serde_json::to_string_pretty(&m)?),
     }
@@ -145,6 +157,63 @@ fn render_table(cfg: &Config, m: &Measurement, markdown: bool) -> String {
         );
     }
     out
+}
+
+/// Archived data held at remote destinations (§8.3).
+#[derive(Debug, Default, Clone)]
+pub struct Holding {
+    pub destination: String,
+    pub grant: String,
+    pub archives: u64,
+    pub bytes: u64,
+    pub compressed: u64,
+}
+
+/// Remote holdings by destination and grant, from the catalog's archives.
+pub fn remote_holdings(archives: &[crate::catalog::CatalogArchive]) -> Vec<Holding> {
+    let mut grouped: std::collections::BTreeMap<(String, String), Holding> = Default::default();
+    for a in archives {
+        let held = a.destination != crate::config::LOCAL_DESTINATION
+            && matches!(a.state.as_str(), "complete" | "restored-copy-kept");
+        if !held {
+            continue;
+        }
+        let grant = a.grant.clone().unwrap_or_else(|| "(unassigned)".into());
+        let h = grouped
+            .entry((a.destination.clone(), grant.clone()))
+            .or_insert_with(|| Holding {
+                destination: a.destination.clone(),
+                grant,
+                ..Holding::default()
+            });
+        h.archives += 1;
+        h.bytes += a.bytes;
+        h.compressed += a.compressed;
+    }
+    grouped.into_values().collect()
+}
+
+fn remote_table(holdings: &[Holding], markdown: bool) -> String {
+    if holdings.is_empty() {
+        return String::new();
+    }
+    let mut t = Table::new(&[
+        ("DESTINATION", Align::Left),
+        ("GRANT", Align::Left),
+        ("ARCHIVES", Align::Right),
+        ("ORIGINAL", Align::Right),
+        ("STORED", Align::Right),
+    ]);
+    for h in holdings {
+        t.row(vec![
+            h.destination.clone(),
+            h.grant.clone(),
+            h.archives.to_string(),
+            format_bytes(h.bytes),
+            format_bytes(h.compressed),
+        ]);
+    }
+    format!("\nArchived elsewhere\n\n{}", t.render_as(markdown))
 }
 
 fn quota_text(r: &RootUsage) -> String {

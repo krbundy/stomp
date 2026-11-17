@@ -14,6 +14,7 @@ use crate::archive::{
     self, Outcome, Progress, RestoreOptions, RestoreOutcome, RestoreSummary, Settings,
 };
 use crate::config::{Config, LOCAL_DESTINATION};
+use crate::dest::{self, Destination};
 use crate::scan::rules::Rules;
 use crate::table::{Align, Table};
 use crate::tasks::{self, Overrides, Status};
@@ -53,9 +54,7 @@ pub fn archive(
         .clone()
         .unwrap_or_else(|| cfg.archive.default_destination.clone());
     if destination != LOCAL_DESTINATION {
-        bail!(
-            "archiving to {destination:?} arrives with remote destinations (milestone M4); use --to local for now"
-        );
+        dest::open(cfg, &destination)?; // a clear error now rather than in the task
     }
 
     // An archive to continue: named by a task's --id, or found by --resume.
@@ -98,6 +97,8 @@ pub fn archive(
                 level: args.level.unwrap_or(cfg.archive.zstd_level).clamp(1, 22),
                 threads,
                 only_owned: cfg.archive.only_owned,
+                destination: destination.clone(),
+                staging: cfg.staging_dir.clone(),
             }
         }
     };
@@ -336,6 +337,15 @@ fn plan_only(
     Ok(ExitCode::SUCCESS)
 }
 
+/// The destination an archive's chunks are at, unless they're local.
+fn open_remote(cfg: &Config, destination: &str) -> Result<Option<Box<dyn Destination>>> {
+    if destination == LOCAL_DESTINATION {
+        Ok(None)
+    } else {
+        dest::open(cfg, destination).map(Some)
+    }
+}
+
 fn run_archive(
     cfg: &Config,
     data_dir: &Path,
@@ -357,6 +367,7 @@ fn run_archive(
     }
     let rules = Rules::new(cfg, data_dir)?;
     let backend = fs::detect(&s.source)?;
+    let remote = open_remote(cfg, &s.destination)?;
     let counters = Progress::default();
     let finished = AtomicBool::new(false);
     let file = task.map(|id| tasks::progress_path(data_dir, id));
@@ -385,6 +396,7 @@ fn run_archive(
             s,
             &rules,
             backend.as_ref(),
+            remote.as_deref(),
             data_dir,
             &stop,
             &counters,
@@ -556,19 +568,23 @@ pub fn locate(data_dir: &Path, what: &str) -> Result<(PathBuf, PathBuf)> {
     let record = catalog
         .archive(what)?
         .with_context(|| format!("no archive or directory called {what:?}"))?;
-    let dir = PathBuf::from(&record.location);
+    // An archive's records always live in its directory, wherever the chunks are.
+    let source = PathBuf::from(&record.source);
+    let dir = archive::archive_path(&source, &record.id);
     if !dir.exists() {
-        bail!(
-            "archive {what} was at {}, which no longer exists{}",
-            paths::display(&dir),
-            if record.state == "restored" {
-                " (it was restored)"
-            } else {
-                ""
+        let why = match record.state.as_str() {
+            "restored" => " (it was restored)".to_string(),
+            "restored-copy-kept" => {
+                format!(" (it was restored; a copy remains at {})", record.location)
             }
+            _ => String::new(),
+        };
+        bail!(
+            "archive {what}'s records at {} are gone{why}",
+            paths::display(&dir)
         );
     }
-    Ok((dir, PathBuf::from(record.source)))
+    Ok((dir, source))
 }
 
 pub fn show(data_dir: &Path, what: &str) -> Result<()> {
@@ -656,13 +672,17 @@ pub fn show(data_dir: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn verify(data_dir: &Path, what: &str, deep: bool) -> Result<ExitCode> {
+pub fn verify(cfg: &Config, data_dir: &Path, what: &str, deep: bool) -> Result<ExitCode> {
     let (dir, _) = locate(data_dir, what)?;
     if !dir.join(manifest::MANIFEST).exists() {
         bail!(
             "this archive isn't finished; `stomp archive --resume` verifies each chunk as it goes"
         );
     }
+    let settings = archive::load_settings(&dir)?;
+    let remote = open_remote(cfg, &settings.destination)?;
+    let journal = archive::journal::Journal::read(&dir.join("journal.jsonl"))?;
+    let scratch = settings.chunk_dir(&dir);
     let mut by_chunk: BTreeMap<u32, Vec<_>> = BTreeMap::new();
     if deep {
         for record in manifest::read_records(&dir.join(manifest::MANIFEST))? {
@@ -678,10 +698,25 @@ pub fn verify(data_dir: &Path, what: &str, deep: bool) -> Result<ExitCode> {
             .strip_prefix("chunk-")
             .and_then(|n| n.strip_suffix(".tar.zst"))
             .and_then(|n| n.parse::<u32>().ok());
-        let result = match chunk {
-            Some(k) if deep => {
-                archive::verify_chunk(&path, &sum, by_chunk.get(&k).map_or(&[][..], |v| v), true)
+        let records = chunk.and_then(|k| by_chunk.get(&k)).map_or(&[][..], |v| v);
+        let result = match (&remote, chunk, path.exists()) {
+            // A remote chunk: checked where it's stored, or downloaded for a deep check.
+            (Some(remote), Some(k), false) => {
+                let rel = format!("{}/{name}", settings.remote_prefix());
+                if deep {
+                    let tmp = scratch.join(format!("{name}.verify"));
+                    let result = paths::create_private_dir(&scratch)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|()| remote.get(&rel, &tmp))
+                        .and_then(|()| archive::verify_chunk(&tmp, &sum, records, true));
+                    let _ = std::fs::remove_file(&tmp);
+                    result
+                } else {
+                    let size = journal.chunk(k).written.map_or(0, |w| w.1);
+                    remote.verify(&rel, &sum, size, &scratch)
+                }
             }
+            (_, Some(_), _) if deep => archive::verify_chunk(&path, &sum, records, true),
             _ => manifest::sha256_file(&path).and_then(|actual| {
                 if actual == sum {
                     Ok(())
@@ -724,6 +759,7 @@ pub struct RestoreArgs {
     pub to: Option<PathBuf>,
     pub overwrite: bool,
     pub keep_archive: bool,
+    pub delete_remote: bool,
     pub yes: bool,
     pub here: bool,
     pub task: Option<String>,
@@ -771,6 +807,9 @@ pub fn restore(
         if args.keep_archive {
             task_args.push("--keep-archive".into());
         }
+        if args.delete_remote {
+            task_args.push("--delete-remote".into());
+        }
         let state = tasks::submit(
             cfg,
             config_path,
@@ -802,8 +841,20 @@ pub fn restore(
         to: to.clone(),
         overwrite: args.overwrite,
         keep_archive: args.keep_archive,
+        delete_remote: args.delete_remote,
     };
-    match archive::restore(&archive_dir, &source, &options, data_dir, &stop) {
+    let remote = match &settings {
+        Some(s) => open_remote(cfg, &s.destination)?,
+        None => None,
+    };
+    match archive::restore(
+        &archive_dir,
+        &source,
+        &options,
+        remote.as_deref(),
+        data_dir,
+        &stop,
+    ) {
         Err(e) => {
             if let Some(id) = &args.task {
                 let _ = tasks::update(data_dir, id, |t| {
@@ -839,6 +890,133 @@ pub fn restore(
             args.task.as_deref(),
             "restore stopped early; files restored so far are in place",
             &format!("stomp restore {}", args.what),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// stomp archives move
+// ---------------------------------------------------------------------------
+
+pub struct MoveArgs {
+    pub what: String,
+    pub to: String,
+    pub yes: bool,
+    pub here: bool,
+    pub task: Option<String>,
+    pub overrides: Overrides,
+}
+
+/// Moves an archive's chunks to another destination, or back into its directory.
+/// Run it on a login or data-transfer node (`--here`) when compute nodes can't
+/// reach the destination (§13.4).
+pub fn move_archive(
+    cfg: &Config,
+    config_path: &Path,
+    data_dir: &Path,
+    args: MoveArgs,
+) -> Result<ExitCode> {
+    let (archive_dir, _) = locate(data_dir, &args.what)?;
+    let settings = archive::load_settings(&archive_dir)?;
+    let from = open_remote(cfg, &settings.destination)?;
+    let to = open_remote(cfg, &args.to)?;
+    if settings.destination == args.to {
+        bail!("archive {} is already at {}", settings.id, args.to);
+    }
+    if args.task.is_none() && !args.yes {
+        println!(
+            "Move archive {} from {} to {}. Each chunk is verified at {} before any copy is removed.",
+            settings.id, settings.destination, args.to, args.to
+        );
+        if !confirm("Move it?")? {
+            println!("Nothing was changed.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    if args.task.is_none() && !args.here && !in_job() {
+        let task_args = vec![
+            "archives".to_string(),
+            "move".into(),
+            archive_dir.to_string_lossy().into_owned(),
+            "--to".into(),
+            args.to.clone(),
+            "--yes".into(),
+        ];
+        let state = tasks::submit(
+            cfg,
+            config_path,
+            data_dir,
+            "move",
+            &task_args,
+            &args.overrides,
+        )?;
+        println!(
+            "Submitted move task {} as Slurm job {}. Follow it with `stomp tasks`.",
+            state.id,
+            state.slurm_jobs.first().map_or("?", String::as_str)
+        );
+        let remotes: Vec<&str> = [settings.destination.as_str(), args.to.as_str()]
+            .into_iter()
+            .filter(|d| *d != crate::config::LOCAL_DESTINATION)
+            .collect();
+        println!(
+            "If compute nodes can't reach {}, cancel it and run this with --here on a login node.",
+            remotes.join(" or ")
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let stop = progress::stop_flag()?;
+    if let Some(id) = &args.task {
+        tasks::update(data_dir, id, |t| t.status = Status::Running)?;
+        jobs::log_task(
+            data_dir,
+            id,
+            settings.grant.as_deref().unwrap_or(compute::STOMP),
+        );
+    }
+    let result = archive::relocate(
+        &archive_dir,
+        from.as_deref(),
+        to.as_deref(),
+        data_dir,
+        &stop,
+    );
+    match result {
+        Err(e) => {
+            if let Some(id) = &args.task {
+                let _ = tasks::update(data_dir, id, |t| {
+                    t.status = Status::Failed;
+                    t.message = Some(format!("{e:#}"));
+                });
+            }
+            Err(e)
+        }
+        Ok(archive::RelocateOutcome::Complete(location)) => {
+            let text = format!(
+                "Moved archive {} to {}.",
+                settings.id,
+                paths::display(Path::new(&location))
+            );
+            println!("{text}");
+            match &args.task {
+                Some(id) => {
+                    tasks::update(data_dir, id, |t| {
+                        t.status = Status::Done;
+                        t.message = Some(text);
+                    })?;
+                }
+                None => {
+                    open_catalog(data_dir)?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(archive::RelocateOutcome::Incomplete { moved, total }) => continue_or_resubmit(
+            cfg,
+            data_dir,
+            args.task.as_deref(),
+            &format!("moved {moved} of {total} chunk(s) before stopping"),
+            &format!("stomp archives move {} --to {}", settings.id, args.to),
         ),
     }
 }

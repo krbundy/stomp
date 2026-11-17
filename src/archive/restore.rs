@@ -22,6 +22,7 @@ use serde::Serialize;
 use super::journal::{Event, Journal};
 use super::manifest::{self, EntryRecord, Kind, Record};
 use super::{ARCHIVE_DIR, ArchiveRecord, NOTE_FILE, write};
+use crate::dest::Destination;
 
 #[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {
@@ -32,6 +33,9 @@ pub struct RestoreOptions {
     pub overwrite: bool,
     /// Keep the archive even after a complete restore.
     pub keep_archive: bool,
+    /// After a complete restore of a remote archive, delete its copy at the
+    /// destination too (it's kept by default).
+    pub delete_remote: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -139,14 +143,20 @@ fn set_mtime(file: &File, mtime: i64) -> io::Result<()> {
     file.set_times(FileTimes::new().set_modified(when))
 }
 
-/// Restores from the archive in `archive_dir`, whose original location is `source`.
+/// Restores from the archive in `archive_dir`, whose original location is
+/// `source`. Chunks that aren't on disk are downloaded from `remote`.
 pub fn restore(
     archive_dir: &Path,
     source: &Path,
     options: &RestoreOptions,
+    remote: Option<&dyn Destination>,
     data_dir: &Path,
     stop: &AtomicBool,
 ) -> Result<RestoreOutcome> {
+    let settings = super::load_settings(archive_dir).ok();
+    let scratch = settings
+        .as_ref()
+        .map_or_else(|| archive_dir.to_path_buf(), |s| s.chunk_dir(archive_dir));
     let (entries, sums) = load_entries(archive_dir)?;
     let filter = matcher(&options.only)?;
     let dest = options.to.clone().unwrap_or_else(|| source.to_path_buf());
@@ -189,11 +199,31 @@ pub fn restore(
         if stop.load(Ordering::Relaxed) {
             return Ok(RestoreOutcome::Incomplete(summary));
         }
-        let path = archive_dir.join(manifest::chunk_name(k));
+        let name = manifest::chunk_name(k);
         let sha = sums
             .get(&k)
             .ok_or_else(|| anyhow!("no checksum recorded for chunk {k}"))?;
-        write::verify_chunk(&path, sha, &[], false)?;
+        let on_disk = [archive_dir.join(&name), scratch.join(&name)]
+            .into_iter()
+            .find(|p| p.exists());
+        let (path, downloaded) = match on_disk {
+            Some(p) => (p, false),
+            None => {
+                let (remote, s) = remote.zip(settings.as_ref()).with_context(|| {
+                    format!("chunk {k} isn't on disk and the archive's destination isn't available")
+                })?;
+                crate::paths::create_private_dir(&scratch)?;
+                let tmp = scratch.join(format!("{name}.download"));
+                remote.get(&format!("{}/{name}", s.remote_prefix()), &tmp)?;
+                (tmp, true)
+            }
+        };
+        if let Err(e) = write::verify_chunk(&path, sha, &[], false) {
+            if downloaded {
+                let _ = fs::remove_file(&path);
+            }
+            return Err(e);
+        }
         let mut archive =
             tar::Archive::new(zstd::Decoder::new(BufReader::new(File::open(&path)?))?);
         for entry in archive.entries()? {
@@ -282,6 +312,10 @@ pub fn restore(
                 }
             }
         }
+        drop(archive);
+        if downloaded {
+            let _ = fs::remove_file(&path);
+        }
     }
     // Directory permissions and times last, deepest first, so files could be written into them.
     dirs.sort_by(|a, b| b.0.cmp(&a.0));
@@ -302,9 +336,27 @@ pub fn restore(
         && summary.missing_links == 0
         && !options.keep_archive
     {
+        // A remote copy stays unless asked otherwise: it's a backup until deleted.
+        let mut state = "restored";
+        let mut location = archive_dir.to_string_lossy().into_owned();
+        if let (Some(remote), Some(s)) = (remote, settings.as_ref())
+            && s.is_remote()
+        {
+            let prefix = s.remote_prefix();
+            if options.delete_remote {
+                for (name, _) in manifest::read_checksums(&archive_dir.join(manifest::CHECKSUMS))? {
+                    remote.delete(&format!("{prefix}/{name}"))?;
+                }
+                remote.delete(&format!("{prefix}/{}", manifest::README))?;
+                remote.delete(&format!("{prefix}/{}", manifest::CHECKSUMS))?;
+                remote.delete_dir(&prefix)?;
+            } else {
+                state = "restored-copy-kept";
+                location = remote.location(&prefix);
+            }
+        }
         remove_archive(archive_dir, source)?;
         summary.archive_removed = true;
-        let settings = super::load_settings(archive_dir).ok();
         super::send_record(
             data_dir,
             &ArchiveRecord {
@@ -314,10 +366,12 @@ pub fn restore(
                     .to_string_lossy()
                     .into_owned(),
                 source: source.to_string_lossy().into_owned(),
-                grant: settings.and_then(|s| s.grant),
-                destination: "local".into(),
-                location: archive_dir.to_string_lossy().into_owned(),
-                state: "restored".into(),
+                grant: settings.as_ref().and_then(|s| s.grant.clone()),
+                destination: settings
+                    .as_ref()
+                    .map_or_else(|| "local".to_string(), |s| s.destination.clone()),
+                location,
+                state: state.into(),
                 created_at: None,
                 finished_at: Some(jiff::Timestamp::now().to_string()),
                 files: summary.files,

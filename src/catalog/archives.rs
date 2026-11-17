@@ -73,11 +73,12 @@ impl Catalog {
                 .map_err(anyhow::Error::from)
                 .and_then(|t| Ok(serde_json::from_str::<ArchiveRecord>(&t)?));
             match parsed {
-                Ok(r) if r.state == "restored" => {
-                    // A restore only changes the state; the rest of the record stays for history.
+                Ok(r) if r.state.starts_with("restored") => {
+                    // A restore changes only the state and where any copy remains;
+                    // sizes and dates stay for history and remote-holding reports.
                     let updated = self.conn.execute(
-                        "UPDATE archives SET state = 'restored', updated_at = ?2 WHERE id = ?1",
-                        params![r.id, now],
+                        "UPDATE archives SET state = ?2, location = ?3, updated_at = ?4 WHERE id = ?1",
+                        params![r.id, r.state, r.location, now],
                     )?;
                     if updated == 0 {
                         self.put_archive(&r, now)?;

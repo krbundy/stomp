@@ -8,6 +8,7 @@ use anyhow::Result;
 
 use crate::catalog::Catalog;
 use crate::config::{Config, Destination};
+use crate::dest::Check;
 use crate::fs as sfs;
 use crate::units::{format_bytes, format_count};
 use crate::{archive, cmd, compute, jobs, paths, scan, sys, tasks};
@@ -43,8 +44,9 @@ impl Report {
     }
 }
 
-/// Runs the checks and prints a line for each. Returns false if anything failed.
-pub fn run(config_path: &Path, data_dir: &Path) -> Result<bool> {
+/// Runs the checks and prints a line for each. Returns false if anything
+/// failed. `online` also connects to each destination.
+pub fn run(config_path: &Path, data_dir: &Path, online: bool) -> Result<bool> {
     let mut r = Report::default();
     let config = check_config(&mut r, config_path);
     check_state(&mut r, data_dir);
@@ -53,7 +55,7 @@ pub fn run(config_path: &Path, data_dir: &Path) -> Result<bool> {
     }
     check_slurm(&mut r, config.as_ref());
     if let Some(cfg) = &config {
-        check_destinations(&mut r, cfg);
+        check_destinations(&mut r, cfg, online);
     }
 
     println!();
@@ -312,7 +314,7 @@ fn check_slurm(r: &mut Report, cfg: Option<&Config>) {
     );
 }
 
-fn check_destinations(r: &mut Report, cfg: &Config) {
+fn check_destinations(r: &mut Report, cfg: &Config, online: bool) {
     if cfg
         .destinations
         .iter()
@@ -329,14 +331,32 @@ fn check_destinations(r: &mut Report, cfg: &Config) {
         }
     }
     for d in &cfg.destinations {
+        let topic = format!("{} ({})", d.name(), d.kind());
+        if !online {
+            r.line(Status::Info, &topic, "not checked (--offline)");
+            continue;
+        }
+        let dest = match crate::dest::open(cfg, d.name()) {
+            Ok(dest) => dest,
+            Err(e) => {
+                r.line(Status::Fail, &topic, format!("{e:#}"));
+                continue;
+            }
+        };
+        for check in dest.check() {
+            match check {
+                Check::Pass(m) => r.line(Status::Pass, &topic, m),
+                Check::Info(m) => r.line(Status::Info, &topic, m),
+                Check::Warn(m) => r.line(Status::Warn, &topic, m),
+                Check::Fail(m) => r.line(Status::Fail, &topic, m),
+            }
+        }
+    }
+    if !cfg.destinations.is_empty() && std::env::var_os("SLURM_JOB_ID").is_none() {
         r.line(
             Status::Info,
-            "destination",
-            format!(
-                "{} ({}): connection checks arrive with milestone M4",
-                d.name(),
-                d.kind()
-            ),
+            "destinations",
+            "checked from this node; `stomp doctor --submit` checks from a compute node",
         );
     }
 }
