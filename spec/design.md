@@ -1,9 +1,15 @@
 # stomp: Design Specification
 
-**Status:** Draft v0.8 (2026-11-17). Milestones M1 through M5 and M7 are implemented; M6 (cold storage) is deferred.
+**Status:** Draft v0.9 (2026-11-18). Milestones M1 through M5 and M7 are implemented; M6 (cold storage) is deferred.
 **Scope:** Behavior and architecture for the first releases. Open questions are listed in §24.
 
-**Changes since v0.7** (decisions made while building M7, the TUI; details in §19.1):
+**Changes since v0.8** (fixes found while writing the user documentation):
+- **Archives stay recoverable:** a remote copy kept after a restore keeps its records (D37), `stomp archives delete` removes it, and restoring all of an unfinished archive undoes it (D38). Remote deletions remove the manifest first and abort unfinished S3 uploads (D39). `restore --dry-run` shows the plan (§12.6, §13.5).
+- **Where things are:** prompts, `archives` (a WHERE column), `archives show` and the note say where chunks went.
+- **Reports:** the grant report covers the whole grant by default; history gives TB-months in every format and marks gaps as estimated; numbers in CSV and JSON are rounded (§8.2, §18).
+- **Smaller things:** a closed pipe ends stomp quietly, config warnings show with errors, `~` in an SFTP `path` means the server's home, conda package caches are recognized, and the sections above now describe what was built rather than the plan where they differed (§6.2, §7.4, §8.4, §17).
+
+**Changes in v0.8** (decisions made while building M7, the TUI; details in §19.1):
 - **Actions leave the browser** and run the CLI's own commands, with their usual questions and checks (D34).
 - **Grant assignment edits the config in place**, keeping comments and layout, checking the result first, and keeping a `.bak` copy (D35).
 - **Sizes are measured as you browse** (instant on CephFS, a walk elsewhere); the TUI doesn't read scan data for sizes.
@@ -177,7 +183,7 @@ CephFS keeps running totals for every directory and exposes them as virtual exte
 
 ### 6.2 POSIX backend
 
-This backend is used for roots that are not on CephFS, and on other clusters. It has no instant usage, so usage numbers come from the most recent scan. Scans cannot skip unchanged subtrees, so every scan is a full walk.
+This backend is used for roots that are not on CephFS, and on other clusters. It has no instant usage, so `usage`, `du` and the TUI walk the tree to measure it (in parallel, without following symlinks or crossing filesystems), and say so first. The daily run skips its usage sample on such roots rather than walk them. Scans cannot skip unchanged subtrees, so every scan is a full walk.
 
 ## 7. Configuration
 
@@ -291,12 +297,12 @@ destination = "local"
 
 `stomp init` gets a new user started:
 
-1. Proposes roots (default `~`) and detects the backend for each one.
-2. Lists the top-level directories of each root by size and file count. On Ceph this is instant.
-3. Flags excluded directories it detects (environments, caches).
-4. Writes a `config.toml` skeleton with one commented-out `[[grant]]` stub per large top-level directory, ready for the user to fill in.
-5. If `~/.ssh/config` or `~/.aws/config` exists, adds commented-out `[[destination]]` stubs.
-6. Never overwrites an existing config.
+1. Takes the roots from `--root` (default `~`) and detects the backend for each one.
+2. Lists each root's top-level directories. On CephFS it shows each one's size, file count and last change, largest first, which is instant. Elsewhere it lists them alphabetically without sizes rather than walk the tree.
+3. Writes a `config.toml` skeleton with one commented-out `[[grant]]` stub per top-level directory, a commented `[slurm]` block, and a summary of hidden directories and loose files, ready for the user to fill in. `--print` prints it instead.
+4. Never overwrites an existing config.
+
+Flagging environments and caches, and stubs for destinations found in `~/.ssh/config` or `~/.aws/config`, were planned but not built: environments and caches are recognized by scans, and destinations are a few lines to write.
 
 ## 8. Storage attribution
 
@@ -315,7 +321,7 @@ The same calculation is done for file counts (`rfiles`).
 
 The validation rules in §7.3 ensure grant directories never overlap, so this subtraction is exact. Excluded directories found by the last scan are measured with `rbytes` too. Reports show them as "of which" lines inside their grant (or inside unassigned), not as separate grants.
 
-On a POSIX backend the same calculation uses totals from the most recent scan.
+On a POSIX backend the same calculation uses totals from walking the tree.
 
 ### 8.2 Samples and history
 
@@ -332,18 +338,21 @@ For each grant and destination, the catalog records archived bytes (original and
 
 ```
 $ stomp usage
-Root ~  (CephFS, measured 2026-11-16 14:52, quota 50.0 TiB, 61% used)
+Measured 2026-11-16 14:52 EST
 
-GRANT          DIRS   SIZE       FILES         EXCLUDED     LAST CHANGE
-GRANT-A        1      12.4 TiB   38,112,004    1.1 TiB      2h ago
-GRANT-B        2       8.9 TiB    2,004,551    —            3d ago
-GRANT-C        1       3.2 TiB      410,220    220 GiB      41d ago
-(unassigned)   —       6.1 TiB    9,880,112    2.4 TiB      5h ago
-TOTAL                 30.6 TiB   50,406,887
+ROOT   FILESYSTEM       SIZE        FILES   QUOTA
+~      CephFS       30.6 TiB   50,406,887   50.0 TiB (61% used)
 
-Remote:  nas     GRANT-B 4.2 TiB (2.9 TiB compressed), 3 archives
-         spaces  GRANT-C 1.1 TiB (0.7 TiB compressed), 1 archive
+GRANT          DIRS       SIZE        FILES   LAST CHANGE
+GRANT-A           1   12.4 TiB   38,112,004   2h ago
+GRANT-B           2    8.9 TiB    2,004,551   3d ago
+GRANT-C           1    3.2 TiB      410,220   41d ago
+(unassigned)      —    6.1 TiB    9,880,112   5h ago
+------------------------------------------------------
+TOTAL                 30.6 TiB   50,406,887   2h ago
 ```
+
+Below the tables, `usage` lists what's archived elsewhere, by destination and grant ("Archived elsewhere"), and reminds the user of open archive proposals. Excluded directories aren't broken out here: `stomp report reclaimable` and `report grant` show them.
 
 ## 9. Scanning
 
@@ -549,7 +558,7 @@ PLAN → WRITE → VERIFY_LOCAL → [remote: UPLOAD → VERIFY_REMOTE → DELETE
 | I2 | Just before deleting a source file, stomp checks it again. If its size, mtime or ctime has changed since it was archived, the file is kept and flagged *changed during archive* in the manifest and the report. |
 | I3 | A directory is removed only when it is empty after its files have been deleted. stomp never deletes a whole tree recursively. |
 | I4 | Every destructive step is recorded in the journal before and after it runs. A killed task resumes from the journal and never deletes or uploads twice. |
-| I5 | Destructive commands show a plan and ask for confirmation (`--yes` for non-interactive use). `--dry-run` works on every command. |
+| I5 | Destructive commands show a plan and ask for confirmation (`--yes` for non-interactive use). `archive` and `restore` have `--dry-run`, and `archive --estimate` plans without changing anything. |
 | I6 | stomp modifies nothing outside the archive target, its data directory, its staging directory and its paths at the destinations. |
 
 **Space headroom.** Each chunk is finished before the next begins, so the extra space needed is about `chunk_size × chunks in progress`, not the size of the whole directory. Before starting, stomp compares this with the quota headroom (`ceph.quota.*`, if set) and refuses to start if there isn't enough room. Chunks can be built in a `staging_dir` such as scratch.
@@ -655,7 +664,7 @@ Every destination type implements the same operations:
 
 `<base>` is `path` for SFTP and `s3://<bucket>/<prefix>` for S3.
 
-**Re-checking.** `stomp archives verify <id> --remote` checks a remote archive again at any time.
+**Re-checking.** `stomp archives verify <id>` checks a remote archive where it's stored at any time; `--deep` downloads it and checks every file.
 
 ### 13.2 SFTP
 
@@ -673,6 +682,8 @@ Every destination type implements the same operations:
 
 #### 13.3.1 Client
 
+*As built, stomp uses a small built-in client instead of the SDK (§13.5, D25); the SDK-specific points in §13.3 are the original design.*
+
 - **Library.** stomp uses the AWS SDK for Rust (`aws-sdk-s3`), compiled in behind a cargo feature `s3` that is on by default.
 - **Credentials and settings.** The SDK reads the user's existing `~/.aws/config` and `~/.aws/credentials` files, profiles and `AWS_*` environment variables natively. This is the same reuse-what-already-works reasoning as SFTP (D6), and no extra programs are needed.
 - **S3-compatible services** (DigitalOcean Spaces, campus Ceph object storage, MinIO, Wasabi and others) are supported with `endpoint` and, where needed, `force_path_style`.
@@ -683,7 +694,7 @@ Every destination type implements the same operations:
   - Part size is the larger of 64 MiB and `chunk_size / 9000`, which stays under S3's limit of 10,000 parts.
   - The upload ID is recorded in the journal. An interrupted upload resumes by listing the parts already uploaded.
 - **Atomic.** An S3 object becomes visible only when its multipart upload is completed, so no `.partial` naming is needed.
-- **Cleanup.** stomp aborts the incomplete uploads it started when an archive is cancelled. The docs recommend a bucket lifecycle rule that aborts incomplete multipart uploads after a few days, as a backstop.
+- **Cleanup.** A cancelled archive keeps its unfinished uploads so it can resume them. stomp aborts them when the archive is undone or its copy deleted (D39). The docs recommend a bucket lifecycle rule that aborts incomplete multipart uploads after a few days, as a backstop for archives that are never resumed or undone.
 - **Metadata.** Each chunk is stored with `x-amz-meta-stomp-sha256` (the whole chunk's SHA-256) and `x-amz-meta-stomp-archive` (the archive ID).
 
 #### 13.3.3 Verification (`verify`)
@@ -1008,25 +1019,25 @@ TOTAL           516      21,426        624
 
 ## 17. Command-line interface
 
-**Global flags:** `--config <path>`, `--json`, `--dry-run`, `-v`/`-q`.
+**Global flags:** `--config <path>` and `--json`. (`--dry-run` belongs to `archive` and `restore`; `-v`/`-q` weren't built.)
 
 | Command | Purpose | Runs |
 |---------|---------|------|
 | `stomp init` | Create a config from the detected layout | foreground |
 | `stomp doctor [--submit] [--offline]` | Check the environment: backend, quota, Slurm, `sacct`, scrontab, catalog size, and each destination (login, writing, verification method, whether the server enforces checksums). `--submit` runs the checks from a compute node; `--offline` skips the destinations. | foreground / task |
-| `stomp usage [--grant G] [--root R]` | Current storage use by grant (§8.4) | foreground |
+| `stomp usage [--no-record]` | Current storage use by grant (§8.4) | foreground |
 | `stomp du [PATH] [--depth N]` | Directory tree with sizes; instant on Ceph | foreground |
 | `stomp scan [--full] [--resume] [--here] [--time --cpus --mem --partition --account]` | Detailed scan; the Slurm options override `[slurm]` for this task | task |
 | `stomp changes [--since T] [--dirs] [--grant G] [--depth N] [--top N]` | Storage change tracking (§11) | foreground |
 | `stomp report <kind> [options] [--format table\|csv\|json\|md]` | Reports (§18) | foreground |
-| `stomp find [--grant G] [--largest N] [--older-than T] [--ext E]` | Find files and directories, using scan data | foreground |
 | `stomp candidates [--all]` / `stomp candidates dismiss <ID>...` | Review proposals, with estimated space freed and file counts (§16) | foreground |
 | `stomp apply <ID>... \| --all [--yes] [--here]` | Archive proposed directories, each checked again first (§16.1) | task |
 | `stomp archive <DIR> [--to local\|<dest>] [--dry-run] [--estimate] [--resume] [--level N] [--chunk-size S] [--yes] [--here]` | Archive a directory; `--dry-run` and `--estimate` only plan | task |
 | `stomp archives list\|show\|verify [--deep]` | Manage existing archives; `verify` checks remote chunks where they're stored | foreground |
 | `stomp archives move <ID> --to <DEST\|local> [--here] [--yes]` | Move an archive between its directory and destinations (§13.5) | task |
-| `stomp restore <ID\|DIR> [--only PATTERN]... [--to DIR] [--overwrite] [--keep-archive] [--delete-remote] [--yes] [--here]` | Restore (§12.5); resumable by running it again | task |
-| `stomp jobs log <GRANT> [--job ID]... [--name GLOB --since T] [--note TEXT] [--strict]` | Attribute compute jobs to a grant (§15.1) | instant |
+| `stomp archives delete <ID> [--yes]` | Delete the copy kept at a destination after a restore (§13.5) | foreground |
+| `stomp restore <ID\|DIR> [--only PATTERN]... [--to DIR] [--overwrite] [--keep-archive] [--delete-remote] [--dry-run] [--yes] [--here]` | Restore (§12.5); resumable by running it again | task |
+| `stomp jobs log <GRANT> [--job ID]... [--note TEXT] [--strict]` | Attribute compute jobs to a grant (§15.1) | instant |
 | `stomp jobs list [--grant G \| --unassigned] [--since T] [--no-sync]` | Compute jobs with their grant and usage | foreground |
 | `stomp jobs sync` | Import accounting records now; other commands do it when the last import is over 15 minutes old | foreground |
 | `stomp jobs retag <GRANT> <JOB>...` / `untag <JOB>...` | Fix attributions (§15.1) | foreground |
@@ -1269,6 +1280,7 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 
 ## 25. Future ideas
 
+- `stomp find`: files and directories by size, age or extension, from scan data (planned in §17 but not built; `report stale`, `report grant` and the TUI cover the common questions).
 - Offer to convert Apptainer sandboxes to SIF images (`apptainer build x.sif sandbox/`). One file replaces millions, which saves both space and load on the metadata server.
 - Duplicate detection within and across grants.
 - Shared grant definitions for collaborators, so a lab or group can see combined storage and compute per grant across users.
