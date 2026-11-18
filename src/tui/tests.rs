@@ -191,10 +191,9 @@ fn assigns_directories_to_grants_in_the_config() {
     assert_eq!(loose.grant.as_deref(), Some("B"));
     let text = std::fs::read_to_string(&f.config).unwrap();
     assert!(text.contains("# keep this comment"));
-    assert!(
-        text.contains(&format!("\"{}/loose\"", f.root.display())),
-        "{text}"
-    );
+    // Written the way stomp shows paths (`~/...` when under $HOME).
+    let entry = crate::paths::display(&f.root.join("loose"));
+    assert!(text.contains(&format!("\"{entry}\"")), "{text}");
     assert!(PathBuf::from(format!("{}.bak", f.config.display())).exists());
 
     // Now it offers removal first.

@@ -744,7 +744,9 @@ mod tests {
         let (h, m) = parse_at(&default_at()).unwrap();
         assert!((2..5).contains(&h) && (0..60).contains(&m));
 
-        let tz = TimeZone::get("America/New_York").unwrap();
+        // A POSIX rule rather than a tz database name, so the test runs on
+        // systems without one (such as the Alpine build container).
+        let tz = TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").unwrap();
         let now = jiff::civil::date(2026, 11, 17)
             .at(2, 0, 0, 0)
             .to_zoned_datetime(tz)

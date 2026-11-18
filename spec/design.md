@@ -1143,6 +1143,9 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 ### 20.3 Build and distribution
 
 - Built as a static binary for `x86_64-unknown-linux-musl`, so it doesn't depend on the cluster's glibc version. aarch64 can be added if needed.
+- `scripts/build-static.sh` builds it with the local musl toolchain when one is installed, or otherwise in Docker with the official Rust Alpine image, and refuses to ship a dynamically linked result. `--test` runs the test suite against musl first.
+- **The static build uses mimalloc** (D36). musl's own allocator serializes threads, and parallel directory walks ran about 7× slower than the glibc build (`du` over 526k files: 0.97 s vs 0.11 s). With mimalloc they're close (0.14 s), as is a full scan. Archiving is about 20% slower than glibc (3.0 s vs 2.4 s for 444 MiB), which CephFS I/O will hide.
+- Checked on CentOS 7 (glibc 2.17), Rocky Linux 8 and 9 containers: init, usage, du, scan, archive, verify, restore, and an HTTPS request to Spaces (DNS, TLS and signing work with the built-in root certificates).
 - Users copy one file into `~/bin`.
 - **External programs are needed only for the features that use them:** OpenSSH `ssh`/`sftp` for SFTP destinations, and Slurm's `sbatch`, `squeue`, `sacct` and `scrontab` for tasks and compute attribution.
 
@@ -1228,6 +1231,7 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | D33 | The daily run writes the catalog briefly, like an interactive command | The usage sample and accounting import are seconds of work; routing them through the inbox would only add delay |
 | D34 | TUI actions step out to the CLI's own commands | One implementation of each check, question and message; nothing destructive is reimplemented |
 | D35 | The TUI edits the config in place, validating first and keeping a `.bak` | Users' comments and layout survive; a bad edit is never saved |
+| D36 | The static musl build uses mimalloc as its allocator | musl's allocator made parallel walks about 7× slower; glibc builds keep the system allocator |
 
 ## 24. Open questions
 

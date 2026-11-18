@@ -178,15 +178,24 @@ Results land in `stomp-test-<job>.out` (with a summary at the end) and
 cargo build --release              # target/release/stomp
 ```
 
-For a static binary that runs on any Linux cluster regardless of its glibc
-version (needs `musl-tools` for the bundled SQLite):
+For the cluster, build a static binary. It has no shared library
+dependencies, so it runs on any x86_64 Linux whatever its glibc version
+(checked on CentOS 7 through Rocky Linux 9):
 
 ```sh
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+scripts/build-static.sh          # dist/stomp-<version>-x86_64-linux
+scripts/build-static.sh --test   # run the tests against musl first
 ```
 
-Copy the binary to `~/bin` on the cluster.
+It uses the local musl toolchain if you have one (`sudo apt install
+musl-tools` and `rustup target add x86_64-unknown-linux-musl`), and Docker
+otherwise. Then copy it to the cluster:
+
+```sh
+ssh <cluster> 'mkdir -p ~/bin'
+scp dist/stomp-0.1.0-x86_64-linux <cluster>:bin/stomp
+ssh <cluster> 'chmod +x ~/bin/stomp && ~/bin/stomp --version'
+```
 
 ## Getting started
 
