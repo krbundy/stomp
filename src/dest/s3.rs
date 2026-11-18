@@ -468,6 +468,51 @@ impl S3 {
         }
     }
 
+    /// Unfinished multipart uploads whose keys start with `prefix`: (key, upload ID).
+    fn list_uploads(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        let mut markers: Option<(String, String)> = None;
+        loop {
+            let mut query = vec![("uploads", String::new()), ("prefix", prefix.to_string())];
+            if let Some((key, id)) = &markers {
+                query.push(("key-marker", key.clone()));
+                query.push(("upload-id-marker", id.clone()));
+            }
+            let text = self
+                .request("GET", None, &query, &[], &[], None)?
+                .ok("listing unfinished uploads")?
+                .text();
+            for upload in blocks(&text, "Upload") {
+                if let (Some(key), Some(id)) = (tag(upload, "Key"), tag(upload, "UploadId")) {
+                    out.push((key, id));
+                }
+            }
+            match (
+                tag(&text, "IsTruncated").as_deref(),
+                tag(&text, "NextKeyMarker"),
+                tag(&text, "NextUploadIdMarker"),
+            ) {
+                (Some("true"), Some(key), Some(id)) => markers = Some((key, id)),
+                _ => return Ok(out),
+            }
+        }
+    }
+
+    fn abort_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        let r = self.request(
+            "DELETE",
+            Some(key),
+            &[("uploadId", upload_id.to_string())],
+            &[],
+            &[],
+            None,
+        )?;
+        if r.status != 404 {
+            r.ok("abandoning an unfinished upload")?;
+        }
+        Ok(())
+    }
+
     /// Streams an object, returning its SHA-256 and size.
     fn hash_object(&self, key: &str) -> Result<(String, u64)> {
         let mut hasher = Sha256::new();
@@ -689,6 +734,13 @@ impl Destination for S3 {
 
     fn delete_dir(&self, _rel: &str) -> Result<()> {
         Ok(()) // object storage has no directories
+    }
+
+    fn clean_up(&self, rel: &str) -> Result<()> {
+        for (key, id) in self.list_uploads(&format!("{}/", self.key(rel)))? {
+            self.abort_upload(&key, &id)?;
+        }
+        Ok(())
     }
 
     fn list(&self, rel: &str) -> Result<Vec<(String, u64)>> {

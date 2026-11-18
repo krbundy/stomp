@@ -73,7 +73,7 @@ impl Catalog {
                 .map_err(anyhow::Error::from)
                 .and_then(|t| Ok(serde_json::from_str::<ArchiveRecord>(&t)?));
             match parsed {
-                Ok(r) if r.state.starts_with("restored") => {
+                Ok(r) if r.state.starts_with("restored") || r.state == "abandoned" => {
                     // A restore changes only the state and where any copy remains;
                     // sizes and dates stay for history and remote-holding reports.
                     let updated = self.conn.execute(

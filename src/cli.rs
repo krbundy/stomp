@@ -199,6 +199,9 @@ enum Command {
         /// After restoring everything, also delete the copy at the destination (kept by default)
         #[arg(long)]
         delete_remote: bool,
+        /// Show what would be restored, and any conflicts, without restoring anything
+        #[arg(long)]
+        dry_run: bool,
         /// Don't ask for confirmation
         #[arg(long, short)]
         yes: bool,
@@ -336,6 +339,17 @@ enum ArchivesCommand {
         task: Option<String>,
         #[command(flatten)]
         slurm: SlurmArgs,
+    },
+    /// Delete the copy of an archive kept at a destination after its files were restored
+    ///
+    /// After `stomp restore` brings everything back, the copy at the
+    /// destination is kept as a backup. This deletes it, for good.
+    Delete {
+        /// Archive ID, or the directory its files were restored to
+        archive: String,
+        /// Don't ask for confirmation
+        #[arg(long, short)]
+        yes: bool,
     },
 }
 
@@ -802,7 +816,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Command::Archives { action, format: f } => match action {
             None | Some(ArchivesCommand::List) => cmd::archive::list(&data_dir, format(f))?,
-            Some(ArchivesCommand::Show { archive }) => cmd::archive::show(&data_dir, &archive)?,
+            Some(ArchivesCommand::Show { archive }) => {
+                cmd::archive::show(&load_config(&config_path)?, &data_dir, &archive)?
+            }
+            Some(ArchivesCommand::Delete { archive, yes }) => {
+                return cmd::archive::delete(&load_config(&config_path)?, &data_dir, &archive, yes);
+            }
             Some(ArchivesCommand::Verify { archive, deep }) => {
                 return cmd::archive::verify(
                     &load_config(&config_path)?,
@@ -842,6 +861,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             overwrite,
             keep_archive,
             delete_remote,
+            dry_run,
             yes,
             here,
             task,
@@ -855,6 +875,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 overwrite,
                 keep_archive,
                 delete_remote,
+                dry_run,
                 yes,
                 here,
                 task,

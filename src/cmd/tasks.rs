@@ -144,10 +144,28 @@ pub fn show(data_dir: &Path, id: &str) -> Result<()> {
 
 pub fn cancel(data_dir: &Path, id: &str) -> Result<()> {
     let task = tasks::cancel(data_dir, id)?;
-    println!(
-        "Cancelled task {} (Slurm job {}). A cancelled scan keeps its finished parts; `stomp scan --resume` continues it.",
+    let text = format!(
+        "Cancelled task {} (Slurm job {}). {}",
         task.id,
-        task.slurm_jobs.last().map_or("?", String::as_str)
+        task.slurm_jobs.last().map_or("?", String::as_str),
+        after_cancel(&task.kind)
     );
+    println!("{}", text.trim_end());
     Ok(())
+}
+
+/// What's left after cancelling a task of this kind, and how to go on.
+fn after_cancel(kind: &str) -> &'static str {
+    match kind {
+        "scan" => "Its finished parts are kept; `stomp scan --resume` continues it.",
+        "archive" => {
+            "Everything removed so far is safe in the archive; `stomp archive --resume DIR` \
+             continues it, and `stomp restore DIR` undoes it."
+        }
+        "restore" => "Files restored so far stay; running the restore again continues it.",
+        "move" => {
+            "Every chunk is still in one place or the other; running the move again continues it."
+        }
+        _ => "",
+    }
 }

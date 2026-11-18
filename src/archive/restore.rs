@@ -49,6 +49,29 @@ pub struct RestoreSummary {
     /// Hard links whose target wasn't restored.
     pub missing_links: u64,
     pub archive_removed: bool,
+    /// The archive was unfinished, so restoring everything undid it.
+    pub abandoned: bool,
+    /// Where a copy of the archive remains, if anywhere.
+    pub copy_kept_at: Option<String>,
+}
+
+/// What a restore would do, for `--dry-run` and for checking a request
+/// before submitting a task.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RestorePlan {
+    pub files: u64,
+    pub bytes: u64,
+    pub dirs: u64,
+    pub links: u64,
+    /// Files already in place exactly as archived.
+    pub already: u64,
+    /// Existing files that differ from the archive.
+    pub conflicts: Vec<String>,
+    /// Chunks to read, and how many of them must be downloaded.
+    pub chunks: usize,
+    pub downloads: usize,
+    /// Whether the archive is finished; restoring all of an unfinished one undoes it.
+    pub finished: bool,
 }
 
 pub enum RestoreOutcome {
@@ -93,6 +116,123 @@ fn load_entries(archive_dir: &Path) -> Result<(Vec<EntryRecord>, HashMap<u32, St
         }
     }
     Ok((entries, sums))
+}
+
+/// The selected entries (path and record) and every record a restore needs:
+/// the selection plus the directories holding it, keyed by tar path.
+type Selection<'a> = (
+    Vec<(PathBuf, &'a EntryRecord)>,
+    HashMap<Vec<u8>, &'a EntryRecord>,
+);
+
+fn select<'a>(entries: &'a [EntryRecord], only: &[String]) -> Result<Selection<'a>> {
+    let filter = matcher(only)?;
+    let mut selected: Vec<(PathBuf, &EntryRecord)> = Vec::new();
+    for r in entries {
+        let rel = r.rel()?;
+        if filter.as_ref().is_none_or(|f| f.is_match(&rel)) {
+            selected.push((rel, r));
+        }
+    }
+    // Nothing at all is fine: an unfinished archive may not have written a
+    // chunk yet, and restoring it still undoes it. Patterns must match.
+    if selected.is_empty() && !only.is_empty() {
+        bail!(
+            "nothing in the archive matches {}; patterns are relative to the archived directory, \
+             e.g. `results` or `results/*.csv`",
+            only.iter()
+                .map(|p| format!("--only {p:?}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    // Directories holding selected entries are recreated too.
+    let selected_paths: HashSet<PathBuf> = selected.iter().map(|(p, _)| p.clone()).collect();
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    for p in &selected_paths {
+        for a in p.ancestors().skip(1) {
+            if !a.as_os_str().is_empty() {
+                needed_dirs.insert(a.to_path_buf());
+            }
+        }
+    }
+    let wanted = entries
+        .iter()
+        .filter_map(|r| {
+            let rel = r.rel().ok()?;
+            (selected_paths.contains(&rel) || needed_dirs.contains(&rel))
+                .then(|| (rel.as_os_str().as_bytes().to_vec(), r))
+        })
+        .collect();
+    Ok((selected, wanted))
+}
+
+/// Where chunks are downloaded to during a restore. Restoring from kept
+/// records (the files were restored before, a copy stays at a destination)
+/// downloads next to where the files go, not into stomp's data directory.
+fn scratch_dir(
+    archive_dir: &Path,
+    data_dir: &Path,
+    dest: &Path,
+    settings: Option<&super::Settings>,
+) -> PathBuf {
+    match settings {
+        Some(s) if super::is_kept_records(archive_dir, data_dir) => s
+            .staging
+            .as_ref()
+            .map_or_else(|| dest.join(ARCHIVE_DIR).join(&s.id), |st| st.join(&s.id)),
+        Some(s) => s.chunk_dir(archive_dir),
+        None => archive_dir.to_path_buf(),
+    }
+}
+
+/// Plans a restore without changing anything. `check_targets` also looks at
+/// what's already where the files would go (a metadata lookup per file).
+pub fn restore_plan(
+    archive_dir: &Path,
+    source: &Path,
+    options: &RestoreOptions,
+    data_dir: &Path,
+    check_targets: bool,
+) -> Result<RestorePlan> {
+    let settings = super::load_settings(archive_dir).ok();
+    let dest = options.to.clone().unwrap_or_else(|| source.to_path_buf());
+    let scratch = scratch_dir(archive_dir, data_dir, &dest, settings.as_ref());
+    let (entries, _) = load_entries(archive_dir)?;
+    let (selected, wanted) = select(&entries, &options.only)?;
+    let mut plan = RestorePlan {
+        finished: archive_dir.join(manifest::MANIFEST).exists(),
+        ..RestorePlan::default()
+    };
+    let chunks: BTreeSet<u32> = wanted.values().map(|r| r.chunk).collect();
+    plan.chunks = chunks.len();
+    plan.downloads = chunks
+        .iter()
+        .filter(|k| {
+            let name = manifest::chunk_name(**k);
+            !archive_dir.join(&name).exists() && !scratch.join(&name).exists()
+        })
+        .count();
+    for (rel, r) in &selected {
+        let target = dest.join(rel);
+        match r.kind {
+            Kind::Dir => plan.dirs += 1,
+            Kind::Symlink | Kind::Hardlink => plan.links += 1,
+            Kind::File => {
+                plan.files += 1;
+                plan.bytes += r.size;
+            }
+        }
+        if !check_targets || r.kind == Kind::Dir || fs::symlink_metadata(&target).is_err() {
+            continue;
+        }
+        if already_restored(&target, r) {
+            plan.already += 1;
+        } else if !((r.changed || r.kept) && options.to.is_none()) {
+            plan.conflicts.push(rel.to_string_lossy().into_owned());
+        }
+    }
+    Ok(plan)
 }
 
 fn matcher(patterns: &[String]) -> Result<Option<GlobSet>> {
@@ -154,42 +294,12 @@ pub fn restore(
     stop: &AtomicBool,
 ) -> Result<RestoreOutcome> {
     let settings = super::load_settings(archive_dir).ok();
-    let scratch = settings
-        .as_ref()
-        .map_or_else(|| archive_dir.to_path_buf(), |s| s.chunk_dir(archive_dir));
+    let kept_records = super::is_kept_records(archive_dir, data_dir);
     let (entries, sums) = load_entries(archive_dir)?;
-    let filter = matcher(&options.only)?;
+    let (_, wanted) = select(&entries, &options.only)?;
     let dest = options.to.clone().unwrap_or_else(|| source.to_path_buf());
+    let scratch = scratch_dir(archive_dir, data_dir, &dest, settings.as_ref());
     fs::create_dir_all(&dest)?;
-
-    let mut selected: Vec<(PathBuf, &EntryRecord)> = Vec::new();
-    for r in &entries {
-        let rel = r.rel()?;
-        if filter.as_ref().is_none_or(|f| f.is_match(&rel)) {
-            selected.push((rel, r));
-        }
-    }
-    if selected.is_empty() {
-        bail!("nothing in the archive matches");
-    }
-    // Directories holding selected entries are recreated too.
-    let selected_paths: HashSet<PathBuf> = selected.iter().map(|(p, _)| p.clone()).collect();
-    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    for p in &selected_paths {
-        for a in p.ancestors().skip(1) {
-            if !a.as_os_str().is_empty() {
-                needed_dirs.insert(a.to_path_buf());
-            }
-        }
-    }
-    let wanted: HashMap<Vec<u8>, &EntryRecord> = entries
-        .iter()
-        .filter_map(|r| {
-            let rel = r.rel().ok()?;
-            (selected_paths.contains(&rel) || needed_dirs.contains(&rel))
-                .then(|| (rel.as_os_str().as_bytes().to_vec(), r))
-        })
-        .collect();
     let chunks: BTreeSet<u32> = wanted.values().map(|r| r.chunk).collect();
 
     let mut summary = RestoreSummary::default();
@@ -326,63 +436,103 @@ pub fn restore(
         }
         summary.dirs += 1;
     }
+    if kept_records {
+        // Downloads went next to the restored files; tidy up after them.
+        let _ = fs::remove_dir(&scratch);
+        if let Some(parent) = scratch.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
 
     // A complete, clean restore to the original place makes the archive redundant.
     let everything = options.only.is_empty() && options.to.is_none();
-    let finished = archive_dir.join(manifest::MANIFEST).exists();
-    if everything
-        && finished
-        && summary.conflicts.is_empty()
-        && summary.missing_links == 0
-        && !options.keep_archive
-    {
-        // A remote copy stays unless asked otherwise: it's a backup until deleted.
-        let mut state = "restored";
-        let mut location = archive_dir.to_string_lossy().into_owned();
+    let clean = summary.conflicts.is_empty() && summary.missing_links == 0;
+    if !(everything && clean) || options.keep_archive {
         if let (Some(remote), Some(s)) = (remote, settings.as_ref())
-            && s.is_remote()
+            && kept_records
         {
-            let prefix = s.remote_prefix();
-            if options.delete_remote {
-                for (name, _) in manifest::read_checksums(&archive_dir.join(manifest::CHECKSUMS))? {
-                    remote.delete(&format!("{prefix}/{name}"))?;
-                }
-                remote.delete(&format!("{prefix}/{}", manifest::README))?;
-                remote.delete(&format!("{prefix}/{}", manifest::CHECKSUMS))?;
-                remote.delete_dir(&prefix)?;
-            } else {
-                state = "restored-copy-kept";
-                location = remote.location(&prefix);
-            }
+            summary.copy_kept_at = Some(remote.location(&s.remote_prefix()));
         }
-        remove_archive(archive_dir, source)?;
-        summary.archive_removed = true;
-        super::send_record(
-            data_dir,
-            &ArchiveRecord {
-                id: archive_dir
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                source: source.to_string_lossy().into_owned(),
-                grant: settings.as_ref().and_then(|s| s.grant.clone()),
-                destination: settings
-                    .as_ref()
-                    .map_or_else(|| "local".to_string(), |s| s.destination.clone()),
-                location,
-                state: state.into(),
-                created_at: None,
-                finished_at: Some(jiff::Timestamp::now().to_string()),
-                files: summary.files,
-                bytes: summary.bytes,
-                compressed: 0,
-                chunks: 0,
-                kept: 0,
-                skipped: 0,
-            },
-        )?;
+        return Ok(RestoreOutcome::Complete(summary));
     }
+    let finished = archive_dir.join(manifest::MANIFEST).exists();
+    let remote_copy = remote.zip(settings.as_ref().filter(|s| s.is_remote()));
+    let id = archive_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let state;
+    let mut location = source.to_string_lossy().into_owned();
+    if !finished {
+        // Everything archived so far is back, and the rest never left: the
+        // unfinished archive is undone. Uploaded chunks go too.
+        if let Some((remote, s)) = remote_copy {
+            crate::dest::delete_archive(remote, &s.remote_prefix())?;
+        }
+        if let Some(s) = &settings
+            && s.is_remote()
+            && s.staging.is_some()
+        {
+            let _ = fs::remove_dir_all(s.chunk_dir(archive_dir));
+        }
+        remove_archive(archive_dir, source, None)?;
+        summary.archive_removed = true;
+        summary.abandoned = true;
+        state = "abandoned";
+    } else if let Some((remote, s)) = remote_copy {
+        let prefix = s.remote_prefix();
+        if options.delete_remote {
+            crate::dest::delete_archive(remote, &prefix)?;
+            if kept_records {
+                fs::remove_dir_all(archive_dir)?;
+            } else {
+                remove_archive(archive_dir, source, None)?;
+            }
+            summary.archive_removed = true;
+            state = "restored";
+        } else {
+            // The copy at the destination stays, as a backup until deleted.
+            // Its records move to stomp's data directory, so it can still be
+            // listed, checked and restored from.
+            location = remote.location(&prefix);
+            summary.copy_kept_at = Some(location.clone());
+            if !kept_records {
+                remove_archive(
+                    archive_dir,
+                    source,
+                    Some(&super::kept_records_dir(data_dir, &id)),
+                )?;
+                summary.archive_removed = true;
+            }
+            state = "restored-copy-kept";
+        }
+    } else {
+        remove_archive(archive_dir, source, None)?;
+        summary.archive_removed = true;
+        state = "restored";
+    }
+    super::send_record(
+        data_dir,
+        &ArchiveRecord {
+            id,
+            source: source.to_string_lossy().into_owned(),
+            grant: settings.as_ref().and_then(|s| s.grant.clone()),
+            destination: settings
+                .as_ref()
+                .map_or_else(|| "local".to_string(), |s| s.destination.clone()),
+            location,
+            state: state.into(),
+            created_at: None,
+            finished_at: Some(jiff::Timestamp::now().to_string()),
+            files: summary.files,
+            bytes: summary.bytes,
+            compressed: 0,
+            chunks: 0,
+            kept: 0,
+            skipped: 0,
+        },
+    )?;
     Ok(RestoreOutcome::Complete(summary))
 }
 
@@ -439,16 +589,44 @@ fn write_file(entry: &mut impl io::Read, target: &Path, record: &EntryRecord) ->
     }
 }
 
-/// Removes an archive's files after everything in it was restored.
-fn remove_archive(archive_dir: &Path, source: &Path) -> Result<()> {
+/// Removes an archive's files after everything in it was restored. With
+/// `keep_to`, its records (not its chunks) are copied there first.
+fn remove_archive(archive_dir: &Path, source: &Path, keep_to: Option<&Path>) -> Result<()> {
     let (mut journal, mut state) = Journal::open(&archive_dir.join("journal.jsonl"))?;
     journal.append(&mut state, Event::Restored)?;
     drop(journal);
+    if let Some(kept) = keep_to {
+        keep_records(archive_dir, kept)?;
+    }
     fs::remove_dir_all(archive_dir)?;
     let parent = source.join(ARCHIVE_DIR);
     let _ = fs::remove_dir(&parent); // only if no other archive is there
     if !parent.exists() {
         let _ = fs::remove_file(source.join(NOTE_FILE));
+    }
+    Ok(())
+}
+
+/// Copies an archive's records (everything but chunks) to `kept`, leaving
+/// out a manifest bigger than [`super::KEEP_MANIFEST_LIMIT`].
+fn keep_records(archive_dir: &Path, kept: &Path) -> Result<()> {
+    crate::paths::create_private_dir(kept)?;
+    for name in [
+        "settings.json",
+        "journal.jsonl",
+        manifest::CHECKSUMS,
+        manifest::README,
+        manifest::MANIFEST,
+    ] {
+        let from = archive_dir.join(name);
+        let Ok(md) = fs::metadata(&from) else {
+            continue;
+        };
+        if name == manifest::MANIFEST && md.len() > super::KEEP_MANIFEST_LIMIT {
+            continue;
+        }
+        fs::copy(&from, kept.join(name))
+            .with_context(|| format!("cannot keep {} in {}", name, kept.display()))?;
     }
     Ok(())
 }

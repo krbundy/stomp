@@ -13,8 +13,8 @@ use sha2::Sha256;
 use super::*;
 use crate::config::S3Destination;
 
-/// An unfinished multipart upload: the recorded checksum and the parts so far.
-type Upload = (Option<String>, BTreeMap<u32, Vec<u8>>);
+/// An unfinished multipart upload: the recorded checksum, the parts so far, and its key.
+type Upload = (Option<String>, BTreeMap<u32, Vec<u8>>, String);
 
 #[derive(Default)]
 struct State {
@@ -122,7 +122,11 @@ fn mock() -> Mock {
                     let id = format!("upload-{}", s.next_upload);
                     s.uploads.insert(
                         id.clone(),
-                        (header(&req, "x-amz-meta-stomp-sha256"), BTreeMap::new()),
+                        (
+                            header(&req, "x-amz-meta-stomp-sha256"),
+                            BTreeMap::new(),
+                            key.clone(),
+                        ),
                     );
                     drop(s);
                     respond(
@@ -145,8 +149,31 @@ fn mock() -> Mock {
                     drop(s);
                     respond(req, 200, Vec::new(), &[("ETag", etag)]);
                 }
+                ("GET", true, None) => {
+                    let prefix = query.get("prefix").cloned().unwrap_or_default();
+                    let mut xml = String::from("<ListMultipartUploadsResult>");
+                    for (id, (_, _, k)) in &s.uploads {
+                        if k.starts_with(&prefix) {
+                            xml += &format!(
+                                "<Upload><Key>{k}</Key><UploadId>{id}</UploadId></Upload>"
+                            );
+                        }
+                    }
+                    xml += "<IsTruncated>false</IsTruncated></ListMultipartUploadsResult>";
+                    drop(s);
+                    respond(req, 200, xml.into_bytes(), &[]);
+                }
+                ("DELETE", _, Some(id)) => {
+                    let found = s.uploads.remove(id).is_some();
+                    drop(s);
+                    if found {
+                        respond(req, 204, Vec::new(), &[]);
+                    } else {
+                        error(req, 404, "NoSuchUpload");
+                    }
+                }
                 ("GET", _, Some(id)) => {
-                    let Some((_, parts)) = s.uploads.get(id) else {
+                    let Some((_, parts, _)) = s.uploads.get(id) else {
                         drop(s);
                         error(req, 404, "NoSuchUpload");
                         continue;
@@ -163,7 +190,7 @@ fn mock() -> Mock {
                     respond(req, 200, xml.into_bytes(), &[]);
                 }
                 ("POST", _, Some(id)) => {
-                    let (meta, parts) = s.uploads.remove(id).unwrap();
+                    let (meta, parts, _) = s.uploads.remove(id).unwrap();
                     let data: Vec<u8> = parts.into_values().flatten().collect();
                     s.objects.insert(key, (data, meta));
                     drop(s);
@@ -332,6 +359,38 @@ fn multipart_upload_resumes_after_an_interruption() {
     assert_eq!(s.objects["stomp/u/G/A/big"].0, std::fs::read(&big).unwrap());
     drop(s);
     assert!(!tmp.path().join("big.upload").exists());
+}
+
+#[test]
+fn deleting_an_archive_aborts_its_unfinished_uploads() {
+    let m = mock();
+    let s3 = client(&m, S3Verify::ServerChecksum);
+    let tmp = tempfile::tempdir().unwrap();
+    let (small, sha) = file(tmp.path(), "small", 1000);
+    s3.put(&small, "G/A/chunk-0001.tar.zst", &sha, tmp.path())
+        .unwrap();
+    s3.put(&small, "G/A/manifest.jsonl.zst", &sha, tmp.path())
+        .unwrap();
+    s3.put(&small, "G/B/chunk-0001.tar.zst", &sha, tmp.path())
+        .unwrap();
+    // An upload that was interrupted: its parts are stored until aborted.
+    let (big, big_sha) = file(tmp.path(), "big", 300 << 10);
+    m.state.lock().unwrap().refuse_part = Some(4);
+    assert!(
+        s3.put(&big, "G/A/chunk-0002.tar.zst", &big_sha, tmp.path())
+            .is_err()
+    );
+    assert_eq!(m.state.lock().unwrap().uploads.len(), 1);
+
+    crate::dest::delete_archive(&s3, "G/A").unwrap();
+    let s = m.state.lock().unwrap();
+    assert!(s.uploads.is_empty(), "the unfinished upload was aborted");
+    let left: Vec<&String> = s.objects.keys().collect();
+    assert_eq!(
+        left,
+        ["stomp/u/G/B/chunk-0001.tar.zst"],
+        "only the other archive is left"
+    );
 }
 
 #[test]

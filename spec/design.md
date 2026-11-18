@@ -619,6 +619,8 @@ Tests stop the run after every journaled step in turn, resume it, restore, and c
 - **Resumable:** a file whose size and mtime already match counts as restored (D24).
 - **Kept originals are left alone:** files the archive marked `kept` are newer than the archived copies.
 - **When the archive is removed:** only after a complete restore of everything into the original location, with no conflicts.
+- **Restoring all of an unfinished archive undoes it (D38).** What was archived so far comes back and the rest never left, so the archive's files (and any chunks already uploaded, and unfinished S3 uploads) are removed, the note goes, and the catalog records the archive as `abandoned`. The directory can then be archived afresh. stomp refuses while the archive's task is still queued or running.
+- **`--dry-run`** prints the plan: files, chunks (and how many must be downloaded), what's already in place, conflicts, and what happens to the archive afterwards. Before submitting a task, stomp checks the `--only` patterns against the local manifest, so a pattern that matches nothing fails at once; `--to` is created only by the restore itself.
 
 #### Other commands
 
@@ -798,6 +800,9 @@ Finalized → upload README, SHA256SUMS, then the manifest last → Finished
 
 - Chunks that aren't on disk are downloaded into the staging location, verified, extracted, and deleted.
 - After a complete restore, the remote copy is kept and the archive is recorded as `restored-copy-kept`, unless `--delete-remote` is given.
+- **The kept copy stays usable (D37).** Its records (settings, journal, `SHA256SUMS`, `README.txt`, and the manifest if it's 64 MiB or less) move to `~/.local/share/stomp/manifests/<ID>/`, and the directory becomes ordinary again. `stomp archives show`, `verify` and `restore` find them by ID or by the directory; a manifest that wasn't kept is downloaded and checked for the length of one command. Restoring from them downloads chunks next to the files being restored, not into the data directory.
+- **`stomp archives delete <ID>`** deletes a kept copy, after asking: everything under its prefix (manifest first, so an interrupted deletion never looks complete), unfinished S3 multipart uploads, and the kept records. It refuses an archive that still holds the only copy of its files.
+- **Deleting at a destination** (moves, `--delete-remote`, undoing, `archives delete`) always removes the manifest first and aborts unfinished multipart uploads (D39).
 
 #### Moving archives
 
@@ -1234,6 +1239,9 @@ Start as a single crate whose modules have clear boundaries. Split it into a wor
 | D34 | TUI actions step out to the CLI's own commands | One implementation of each check, question and message; nothing destructive is reimplemented |
 | D35 | The TUI edits the config in place, validating first and keeping a `.bak` | Users' comments and layout survive; a bad edit is never saved |
 | D36 | The static musl build uses mimalloc as its allocator | musl's allocator made parallel walks about 7× slower; glibc builds keep the system allocator |
+| D37 | A remote copy kept after a restore keeps its records in the data directory, the manifest only up to 64 MiB | The copy stays listable, checkable and restorable; huge manifests are fetched when needed instead of filling the user's quota |
+| D38 | Restoring all of an unfinished archive undoes it | The note's "to put everything back" advice must leave a directory that can be archived again, with nothing stranded at the destination |
+| D39 | Remote deletions remove the manifest first and abort unfinished multipart uploads | An interrupted deletion never looks like a complete archive, and abandoned uploads aren't stored (and billed) forever |
 
 ## 24. Open questions
 

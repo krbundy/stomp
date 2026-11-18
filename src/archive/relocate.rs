@@ -150,13 +150,7 @@ pub fn relocate(
     }
     // Only now, with everything safe at the new place, clear the old one.
     if let Some(old) = from {
-        for (_, name, _) in &chunks {
-            old.delete(&format!("{prefix}/{name}"))?;
-        }
-        for name in [manifest::README, manifest::CHECKSUMS, manifest::MANIFEST] {
-            old.delete(&format!("{prefix}/{name}"))?;
-        }
-        old.delete_dir(&prefix)?;
+        crate::dest::delete_archive(old, &prefix)?;
     }
     let updated = Settings {
         destination: target_name.clone(),

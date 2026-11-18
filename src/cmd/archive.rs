@@ -215,16 +215,35 @@ fn print_intent(s: &Settings, resuming: bool) {
 
 /// Refuses to start without room under the quota for the chunk being written (§12.4).
 pub(crate) fn check_headroom(s: &Settings) -> Result<()> {
-    let backend = fs::detect(&s.source)?;
-    if let Ok(Some(quota)) = backend.quota(&s.source)
+    // Chunks are written where they're staged: the archive directory, or
+    // `general.staging_dir` for a remote archive. That's the quota that matters.
+    let written_in = match &s.staging {
+        Some(staging) if s.is_remote() => staging
+            .ancestors()
+            .find(|p| p.exists())
+            .unwrap_or(staging)
+            .to_path_buf(),
+        _ => s.source.clone(),
+    };
+    let backend = fs::detect(&written_in)?;
+    if let Ok(Some(quota)) = backend.quota(&written_in)
         && let Some(max) = quota.max_bytes
     {
         let free = max.saturating_sub(quota.used.bytes);
-        let size = backend.usage(&s.source).map_or(s.chunk_size, |u| u.bytes);
+        // Instant on CephFS, which is where quotas are.
+        let size = fs::detect(&s.source)
+            .ok()
+            .and_then(|b| b.usage(&s.source).ok())
+            .map_or(s.chunk_size, |u| u.bytes);
         let need = size.min(s.chunk_size) + (64 << 20);
         if free < need {
+            let advice = if s.is_remote() && s.staging.is_none() {
+                "free some space, use a smaller --chunk-size, or set general.staging_dir to scratch space"
+            } else {
+                "free some space or use a smaller --chunk-size"
+            };
             bail!(
-                "only {} is free under the quota on {}, and archiving needs about {} for the chunk being written; free some space or use a smaller --chunk-size",
+                "only {} is free under the quota on {}, and archiving needs about {} for the chunk being written; {advice}",
                 format_bytes(free),
                 paths::display(&quota.dir),
                 format_bytes(need)
@@ -579,7 +598,25 @@ pub fn locate(data_dir: &Path, what: &str) -> Result<(PathBuf, PathBuf)> {
             .collect();
         return match found.as_slice() {
             [one] => Ok((one.dir.clone(), path)),
-            [] => bail!("there's no stomp archive in {}", paths::display(&path)),
+            [] => {
+                // Files restored here, with a copy kept at a destination?
+                let source = path.to_string_lossy();
+                let kept: Vec<_> = open_catalog(data_dir)?
+                    .archives()?
+                    .into_iter()
+                    .filter(|a| a.state == "restored-copy-kept" && a.source == source)
+                    .map(|a| archive::kept_records_dir(data_dir, &a.id))
+                    .filter(|d| d.join("settings.json").exists())
+                    .collect();
+                match kept.as_slice() {
+                    [one] => Ok((one.clone(), path)),
+                    [] => bail!("there's no stomp archive in {}", paths::display(&path)),
+                    _ => bail!(
+                        "copies of several archives of {} are kept at destinations; name one by ID (`stomp archives` lists them)",
+                        paths::display(&path)
+                    ),
+                }
+            }
             many => bail!(
                 "{} holds several archives; name one: {}",
                 paths::display(&path),
@@ -597,24 +634,81 @@ pub fn locate(data_dir: &Path, what: &str) -> Result<(PathBuf, PathBuf)> {
     // An archive's records always live in its directory, wherever the chunks are.
     let source = PathBuf::from(&record.source);
     let dir = archive::archive_path(&source, &record.id);
-    if !dir.exists() {
-        let why = match record.state.as_str() {
-            "restored" => " (it was restored)".to_string(),
-            "restored-copy-kept" => {
-                format!(" (it was restored; a copy remains at {})", record.location)
-            }
-            _ => String::new(),
-        };
-        bail!(
-            "archive {what}'s records at {} are gone{why}",
-            paths::display(&dir)
-        );
+    if dir.exists() {
+        return Ok((dir, source));
     }
-    Ok((dir, source))
+    match record.state.as_str() {
+        "restored-copy-kept" => {
+            let kept = archive::kept_records_dir(data_dir, &record.id);
+            if kept.join("settings.json").exists() {
+                return Ok((kept, source));
+            }
+            bail!(
+                "archive {what} was restored and a copy remains at {}, but its records weren't kept \
+                 (an older stomp removed them); that copy's README.txt explains how to restore it by hand",
+                record.location
+            )
+        }
+        "restored" => bail!("archive {what} was restored, and nothing of it remains"),
+        "abandoned" => {
+            bail!("archive {what} was undone before it finished, and nothing of it remains")
+        }
+        _ => bail!(
+            "archive {what}'s records at {} are gone",
+            paths::display(&dir)
+        ),
+    }
 }
 
-pub fn show(data_dir: &Path, what: &str) -> Result<()> {
+/// A manifest downloaded for one command; removed when it's done.
+struct Fetched(Option<PathBuf>);
+
+impl Drop for Fetched {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Kept records leave out a big manifest (see `KEEP_MANIFEST_LIMIT`); this
+/// fetches it from the destination, checked, for the length of a command.
+fn fetch_manifest(cfg: &Config, dir: &Path, data_dir: &Path) -> Result<Fetched> {
+    let path = dir.join(manifest::MANIFEST);
+    if path.exists() || !archive::is_kept_records(dir, data_dir) {
+        return Ok(Fetched(None));
+    }
+    let settings = archive::load_settings(dir)?;
+    let remote = open_remote(cfg, &settings.destination)?
+        .context("the kept records belong to a remote archive, but name no destination")?;
+    let sum = manifest::read_checksums(&dir.join(manifest::CHECKSUMS))?
+        .into_iter()
+        .find(|(name, _)| name == manifest::MANIFEST)
+        .map(|(_, sum)| sum)
+        .context("SHA256SUMS doesn't list the manifest")?;
+    eprintln!(
+        "stomp: fetching archive {}'s manifest from {}",
+        settings.id, settings.destination
+    );
+    let tmp = dir.join(format!("{}.download", manifest::MANIFEST));
+    remote.get(
+        &format!("{}/{}", settings.remote_prefix(), manifest::MANIFEST),
+        &tmp,
+    )?;
+    if manifest::sha256_file(&tmp)? != sum {
+        let _ = std::fs::remove_file(&tmp);
+        bail!(
+            "the manifest downloaded from {} has the wrong checksum",
+            settings.destination
+        );
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(Fetched(Some(path)))
+}
+
+pub fn show(cfg: &Config, data_dir: &Path, what: &str) -> Result<()> {
     let (dir, source) = locate(data_dir, what)?;
+    let _fetched = fetch_manifest(cfg, &dir, data_dir)?;
     let manifest_path = dir.join(manifest::MANIFEST);
     println!(
         "Archive    {}",
@@ -700,6 +794,7 @@ pub fn show(data_dir: &Path, what: &str) -> Result<()> {
 
 pub fn verify(cfg: &Config, data_dir: &Path, what: &str, deep: bool) -> Result<ExitCode> {
     let (dir, _) = locate(data_dir, what)?;
+    let _fetched = fetch_manifest(cfg, &dir, data_dir)?;
     if !dir.join(manifest::MANIFEST).exists() {
         bail!(
             "this archive isn't finished; `stomp archive --resume` verifies each chunk as it goes"
@@ -786,10 +881,20 @@ pub struct RestoreArgs {
     pub overwrite: bool,
     pub keep_archive: bool,
     pub delete_remote: bool,
+    pub dry_run: bool,
     pub yes: bool,
     pub here: bool,
     pub task: Option<String>,
     pub overrides: Overrides,
+}
+
+/// An absolute path for `--to`, without creating anything yet: the restore
+/// creates it, in the task if there is one.
+fn absolute(path: &Path) -> Result<PathBuf> {
+    Ok(match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => paths::normalize(&std::path::absolute(path)?),
+    })
 }
 
 pub fn restore(
@@ -799,14 +904,38 @@ pub fn restore(
     args: RestoreArgs,
 ) -> Result<ExitCode> {
     let (archive_dir, source) = locate(data_dir, &args.what)?;
-    let to = args
-        .to
-        .as_ref()
-        .map(|p| -> Result<PathBuf> {
-            std::fs::create_dir_all(p)?;
-            Ok(std::fs::canonicalize(p)?)
-        })
-        .transpose()?;
+    let to = args.to.as_deref().map(absolute).transpose()?;
+    let options = RestoreOptions {
+        only: args.only.clone(),
+        to: to.clone(),
+        overwrite: args.overwrite,
+        keep_archive: args.keep_archive,
+        delete_remote: args.delete_remote,
+    };
+    if args.task.is_none() {
+        // Checked here, before a task is submitted: the patterns match
+        // something, and an archive being undone isn't still running.
+        let _fetched = fetch_manifest(cfg, &archive_dir, data_dir)?;
+        let plan = archive::restore_plan(&archive_dir, &source, &options, data_dir, args.dry_run)?;
+        if args.dry_run {
+            print_restore_plan(&plan, &archive_dir, &source, &options, data_dir);
+            return Ok(ExitCode::SUCCESS);
+        }
+        let everything = args.only.is_empty() && to.is_none() && !args.keep_archive;
+        if everything
+            && !plan.finished
+            && let Ok(s) = archive::load_settings(&archive_dir)
+            && let Some(t) = tasks::active_for(data_dir, "archive", &s.id)
+        {
+            bail!(
+                "archive {} is still being made by task {} (Slurm job {}); cancel it first with `stomp tasks cancel {}`, then restore",
+                s.id,
+                t.id,
+                t.slurm_jobs.last().map_or("?", String::as_str),
+                t.id
+            );
+        }
+    }
     if args.overwrite && !args.yes && args.task.is_none() {
         println!("Files that already exist where the archive restores to will be replaced.");
         if !confirm("Continue?")? {
@@ -862,13 +991,7 @@ pub fn restore(
         let grant = settings.as_ref().and_then(|s| s.grant.clone());
         jobs::log_task(data_dir, id, grant.as_deref().unwrap_or(compute::STOMP));
     }
-    let options = RestoreOptions {
-        only: args.only.clone(),
-        to: to.clone(),
-        overwrite: args.overwrite,
-        keep_archive: args.keep_archive,
-        delete_remote: args.delete_remote,
-    };
+    let _fetched = fetch_manifest(cfg, &archive_dir, data_dir)?;
     let remote = match &settings {
         Some(s) => open_remote(cfg, &s.destination)?,
         None => None,
@@ -891,7 +1014,8 @@ pub fn restore(
             Err(e)
         }
         Ok(RestoreOutcome::Complete(summary)) => {
-            let text = describe_restore(&summary, to.as_deref().unwrap_or(&source));
+            let id = settings.as_ref().map_or("", |s| s.id.as_str());
+            let text = describe_restore(&summary, to.as_deref().unwrap_or(&source), id);
             println!("{text}");
             match &args.task {
                 Some(id) => {
@@ -1047,7 +1171,83 @@ pub fn move_archive(
     }
 }
 
-fn describe_restore(s: &RestoreSummary, into: &Path) -> String {
+fn print_restore_plan(
+    plan: &archive::RestorePlan,
+    archive_dir: &Path,
+    source: &Path,
+    options: &RestoreOptions,
+    data_dir: &Path,
+) {
+    let settings = archive::load_settings(archive_dir).ok();
+    let id = settings.as_ref().map_or("?", |s| s.id.as_str());
+    let into = options.to.as_deref().unwrap_or(source);
+    println!("Restoring archive {id} into {}:", paths::display(into));
+    println!(
+        "  files         {:>8}   {}{}",
+        format_count(plan.files),
+        format_bytes(plan.bytes),
+        if plan.already > 0 {
+            format!("   ({} already in place)", format_count(plan.already))
+        } else {
+            String::new()
+        }
+    );
+    println!("  directories   {:>8}", format_count(plan.dirs));
+    println!("  links         {:>8}", format_count(plan.links));
+    let from = settings
+        .as_ref()
+        .filter(|s| s.is_remote())
+        .map(|s| s.destination.clone());
+    println!(
+        "  chunks        {:>8}{}",
+        plan.chunks,
+        match (&from, plan.downloads) {
+            (Some(dest), n) if n > 0 => format!("   ({n} downloaded from {dest})"),
+            _ => String::new(),
+        }
+    );
+    if !plan.conflicts.is_empty() {
+        let shown: Vec<&str> = plan.conflicts.iter().take(5).map(String::as_str).collect();
+        println!(
+            "{} existing file(s) differ from the archive and would be {}: {}{}",
+            plan.conflicts.len(),
+            if options.overwrite {
+                "replaced (--overwrite)"
+            } else {
+                "left alone (--overwrite replaces them)"
+            },
+            shown.join(", "),
+            if plan.conflicts.len() > 5 {
+                ", ..."
+            } else {
+                ""
+            }
+        );
+    }
+    let everything = options.only.is_empty() && options.to.is_none() && !options.keep_archive;
+    let clean = plan.conflicts.is_empty() || options.overwrite;
+    if everything && clean {
+        let kept = archive::is_kept_records(archive_dir, data_dir);
+        println!(
+            "{}",
+            match (&from, plan.finished, kept) {
+                (_, false, _) => "The archive is unfinished: restoring everything undoes it, and what was archived so far is removed.".to_string(),
+                (Some(dest), true, true) if options.delete_remote => {
+                    format!("Afterwards the copy at {dest} is deleted (--delete-remote).")
+                }
+                (Some(dest), true, true) => format!(
+                    "The copy at {dest} stays; `stomp archives delete {id}` deletes it later."
+                ),
+                (Some(dest), true, false) if options.delete_remote => format!("Afterwards the archive is removed, and so is its copy at {dest}."),
+                (Some(dest), true, false) => format!("Afterwards the archive is removed here; its copy at {dest} stays (--delete-remote deletes it)."),
+                (None, true, _) => "Afterwards the archive is removed.".to_string(),
+            }
+        );
+    }
+    println!("Nothing was changed (--dry-run).");
+}
+
+fn describe_restore(s: &RestoreSummary, into: &Path, id: &str) -> String {
     let mut text = format!(
         "Restored {} files ({}), {} links and {} directories into {}.",
         format_count(s.files),
@@ -1071,10 +1271,74 @@ fn describe_restore(s: &RestoreSummary, into: &Path) -> String {
             s.missing_links
         );
     }
-    text += if s.archive_removed {
-        "\nEverything is back, so the archive was removed."
-    } else {
-        "\nThe archive was kept."
+    text += &match (&s.copy_kept_at, s.archive_removed, s.abandoned) {
+        (_, _, true) => {
+            "\nEverything is back, so the unfinished archive was undone and removed.".to_string()
+        }
+        (Some(at), true, _) => format!(
+            "\nEverything is back. The copy at {at} is kept; `stomp archives delete {id}` deletes it."
+        ),
+        (Some(at), false, _) => format!("\nThe copy at {at} is kept."),
+        (None, true, _) => "\nEverything is back, so the archive was removed.".to_string(),
+        (None, false, _) => "\nThe archive was kept.".to_string(),
     };
     text
+}
+
+// ---------------------------------------------------------------------------
+// stomp archives delete
+// ---------------------------------------------------------------------------
+
+/// Deletes the copy an archive keeps at a destination after its files were
+/// restored, along with its kept records.
+pub fn delete(cfg: &Config, data_dir: &Path, what: &str, yes: bool) -> Result<ExitCode> {
+    let (dir, source) = locate(data_dir, what)?;
+    let settings = archive::load_settings(&dir)?;
+    let id = settings.id.clone();
+    if !archive::is_kept_records(&dir, data_dir) {
+        bail!(
+            "archive {id} still holds the only copy of files from {}; \
+             `stomp restore {id}` brings them back first, and keeps the copy at its destination until you delete it with this command",
+            paths::display(&source)
+        );
+    }
+    let remote = open_remote(cfg, &settings.destination)?
+        .context("the kept records belong to a remote archive, but name no destination")?;
+    let prefix = settings.remote_prefix();
+    let location = remote.location(&prefix);
+    if !yes {
+        println!("Delete archive {id}'s copy at {location}?");
+        println!(
+            "Its files were restored to {}. Check they're still there if you need them: this can't be undone.",
+            paths::display(&source)
+        );
+        if !confirm("Delete it?")? {
+            println!("Nothing was changed.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    dest::delete_archive(remote.as_ref(), &prefix)?;
+    std::fs::remove_dir_all(&dir)?;
+    archive::send_record(
+        data_dir,
+        &archive::ArchiveRecord {
+            id: id.clone(),
+            source: source.to_string_lossy().into_owned(),
+            grant: settings.grant.clone(),
+            destination: settings.destination.clone(),
+            location: source.to_string_lossy().into_owned(),
+            state: "restored".into(),
+            created_at: None,
+            finished_at: None,
+            files: 0,
+            bytes: 0,
+            compressed: 0,
+            chunks: 0,
+            kept: 0,
+            skipped: 0,
+        },
+    )?;
+    open_catalog(data_dir)?;
+    println!("Deleted archive {id}'s copy at {location}.");
+    Ok(ExitCode::SUCCESS)
 }

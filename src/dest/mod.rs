@@ -48,8 +48,15 @@ pub trait Destination: Send + Sync {
     /// Removes an archive's (now empty) directory, where that means anything.
     fn delete_dir(&self, rel: &str) -> Result<()>;
 
-    /// Files under a directory, with their sizes.
+    /// Files under a directory, with their sizes; empty if it doesn't exist.
     fn list(&self, rel: &str) -> Result<Vec<(String, u64)>>;
+
+    /// Removes what interrupted uploads left under `rel` that `list` doesn't
+    /// show, such as unfinished S3 multipart uploads, which are stored (and
+    /// billed) until aborted.
+    fn clean_up(&self, _rel: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Checks that the destination works, for `stomp doctor`.
     fn check(&self) -> Vec<Check>;
@@ -58,6 +65,19 @@ pub trait Destination: Send + Sync {
 /// The directory for an archive's files: `<grant>/<archive id>`.
 pub fn archive_prefix(grant: Option<&str>, id: &str) -> String {
     format!("{}/{id}", grant.unwrap_or("unassigned"))
+}
+
+/// Deletes everything stored for an archive under `prefix`. The manifest
+/// goes first: an archive directory without one counts as unfinished, so an
+/// interrupted deletion never leaves something that looks complete.
+pub fn delete_archive(dest: &dyn Destination, prefix: &str) -> Result<()> {
+    let mut names: Vec<String> = dest.list(prefix)?.into_iter().map(|(n, _)| n).collect();
+    names.sort_by_key(|n| (n != crate::archive::manifest::MANIFEST, n.clone()));
+    for name in &names {
+        dest.delete(&format!("{prefix}/{name}"))?;
+    }
+    dest.clean_up(prefix)?;
+    dest.delete_dir(prefix)
 }
 
 /// Opens a configured destination by name.

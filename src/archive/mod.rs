@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 
 pub use estimate::{Estimate, estimate};
 pub use relocate::{RelocateOutcome, relocate};
-pub use restore::{RestoreOptions, RestoreOutcome, RestoreSummary, restore};
+pub use restore::{
+    RestoreOptions, RestoreOutcome, RestorePlan, RestoreSummary, restore, restore_plan,
+};
 pub use write::{Hook, Outcome, Progress, Summary, archive, entry_records, verify_chunk};
 
 use crate::config::{Config, LOCAL_DESTINATION};
@@ -90,6 +92,23 @@ pub fn update_settings(archive_dir: &Path, settings: &Settings) -> Result<()> {
 
 pub fn archive_path(source: &Path, id: &str) -> PathBuf {
     source.join(ARCHIVE_DIR).join(id)
+}
+
+/// Where an archive's records are kept after its files were restored while
+/// a copy stays at a destination, so that copy can still be listed, checked
+/// and restored from.
+pub fn kept_records_dir(data_dir: &Path, id: &str) -> PathBuf {
+    data_dir.join("manifests").join(id)
+}
+
+/// Kept records include the manifest only up to this size; a bigger one
+/// (millions of files) is fetched from the destination when it's needed,
+/// rather than taking up the user's quota.
+pub const KEEP_MANIFEST_LIMIT: u64 = 64 << 20;
+
+/// Whether `archive_dir` holds kept records rather than a live archive.
+pub fn is_kept_records(archive_dir: &Path, data_dir: &Path) -> bool {
+    archive_dir.starts_with(data_dir.join("manifests"))
 }
 
 /// A new archive ID: `<grant>-<yyyymmdd>-<6 hex>`.

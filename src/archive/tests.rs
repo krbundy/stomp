@@ -228,8 +228,17 @@ impl crate::dest::Destination for DirDest {
         let _ = fs::remove_dir(self.root.join(rel));
         Ok(())
     }
-    fn list(&self, _: &str) -> anyhow::Result<Vec<(String, u64)>> {
-        Ok(Vec::new())
+    fn list(&self, rel: &str) -> anyhow::Result<Vec<(String, u64)>> {
+        let Ok(entries) = fs::read_dir(self.root.join(rel)) else {
+            return Ok(Vec::new());
+        };
+        Ok(entries
+            .filter_map(Result::ok)
+            .map(|e| {
+                let size = e.metadata().map_or(0, |m| m.len());
+                (e.file_name().to_string_lossy().into_owned(), size)
+            })
+            .collect())
     }
     fn check(&self) -> Vec<crate::dest::Check> {
         Vec::new()
@@ -716,6 +725,159 @@ fn remote_archive_round_trip() {
     assert!(restored.archive_removed);
     assert_eq!(snapshot(&f.source), before);
     assert_eq!(remote.files().len(), files.len(), "the remote copy is kept");
+}
+
+#[test]
+fn a_kept_remote_copy_can_be_restored_from_again_and_deleted() {
+    let f = Fixture::remote();
+    let before = snapshot(&f.source);
+    f.archive();
+    let first = f.restore(&RestoreOptions::default());
+    assert!(first.archive_removed);
+    assert_eq!(
+        first.copy_kept_at.as_deref(),
+        Some("store:T/T-20261117-000001")
+    );
+    // The directory is ordinary again; the records moved to stomp's data directory.
+    assert!(!f.source.join(ARCHIVE_DIR).exists() && !f.source.join(NOTE_FILE).exists());
+    let kept = super::kept_records_dir(&f.data(), "T-20261117-000001");
+    for name in [
+        "settings.json",
+        "journal.jsonl",
+        manifest::MANIFEST,
+        manifest::CHECKSUMS,
+        manifest::README,
+    ] {
+        assert!(kept.join(name).exists(), "{name} isn't kept");
+    }
+    assert!(
+        !walk(&kept)
+            .iter()
+            .any(|p| p.to_string_lossy().contains("chunk-")),
+        "no chunks are kept locally"
+    );
+
+    // Lose a directory, and restore it from the copy at the destination.
+    fs::remove_dir_all(f.source.join("a")).unwrap();
+    let again = match restore(
+        &kept,
+        &f.source,
+        &RestoreOptions {
+            only: vec!["a".into()],
+            ..RestoreOptions::default()
+        },
+        f.dest(),
+        &f.data(),
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    {
+        RestoreOutcome::Complete(s) => s,
+        RestoreOutcome::Incomplete(_) => panic!("restore didn't finish"),
+    };
+    assert_eq!(snapshot(&f.source), before);
+    assert!(!again.archive_removed && again.copy_kept_at.is_some());
+    assert!(
+        !f.source.join(ARCHIVE_DIR).exists(),
+        "downloaded chunks were tidied up"
+    );
+    assert!(kept.join("settings.json").exists(), "the records stay");
+
+    // `stomp archives delete` removes the copy for good.
+    crate::dest::delete_archive(f.dest().unwrap(), "T/T-20261117-000001").unwrap();
+    assert!(f.remote.as_ref().unwrap().files().is_empty());
+}
+
+#[test]
+fn restoring_all_of_an_unfinished_archive_undoes_it() {
+    for make in [Fixture::new as fn() -> Fixture, Fixture::remote] {
+        let steps = {
+            let f = make();
+            let count = AtomicUsize::new(0);
+            f.archive_with(&|_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                false
+            })
+            .unwrap();
+            count.load(Ordering::SeqCst)
+        };
+        // Before any chunk, partway (some originals already removed), and late.
+        for stop_at in [1, steps / 3, steps / 2, steps - 2] {
+            let f = make();
+            let before = snapshot(&f.source);
+            let count = AtomicUsize::new(0);
+            let first = f
+                .archive_with(&|_| count.fetch_add(1, Ordering::SeqCst) + 1 == stop_at)
+                .unwrap();
+            assert!(matches!(first, Outcome::Incomplete(_)), "step {stop_at}");
+
+            let undone = f.restore(&RestoreOptions::default());
+            assert!(undone.abandoned && undone.archive_removed, "step {stop_at}");
+            assert_eq!(snapshot(&f.source), before, "step {stop_at}");
+            assert!(
+                !f.source.join(ARCHIVE_DIR).exists() && !f.source.join(NOTE_FILE).exists(),
+                "step {stop_at}: stomp's files are gone"
+            );
+            if let Some(remote) = &f.remote {
+                assert!(
+                    remote.files().is_empty(),
+                    "step {stop_at}: uploaded chunks are deleted: {:?}",
+                    remote.files()
+                );
+                let staging = f.base.join("staging");
+                assert!(!staging.exists() || !walk(&staging).iter().any(|p| p.is_file()));
+            }
+            // And the directory can be archived afresh.
+            assert!(matches!(
+                f.archive_with(&|_| false).unwrap(),
+                Outcome::Complete(_)
+            ));
+        }
+    }
+}
+
+#[test]
+fn restore_plans_say_what_would_happen() {
+    let f = Fixture::new();
+    f.archive();
+    let plan = |options: &RestoreOptions| {
+        super::restore_plan(&f.archive_dir(), &f.source, options, &f.data(), true).unwrap()
+    };
+    let all = plan(&RestoreOptions::default());
+    assert!(all.finished && all.files > 5 && all.chunks >= 3 && all.downloads == 0);
+    assert!(all.conflicts.is_empty() && all.already == 0);
+
+    let some = plan(&RestoreOptions {
+        only: vec!["a/deep".into()],
+        ..RestoreOptions::default()
+    });
+    // One file; its chunk, plus the one holding its parent directories' entries.
+    assert_eq!(some.files, 1);
+    assert!(
+        some.chunks < all.chunks,
+        "{} of {}",
+        some.chunks,
+        all.chunks
+    );
+
+    // A file that's back already counts as in place; a different one conflicts.
+    put(&f.source.join("a/one.txt"), b"changed since");
+    let conflicted = plan(&RestoreOptions::default());
+    assert_eq!(conflicted.conflicts, ["a/one.txt"]);
+
+    let err = super::restore_plan(
+        &f.archive_dir(),
+        &f.source,
+        &RestoreOptions {
+            only: vec!["nothing/here".into()],
+            ..RestoreOptions::default()
+        },
+        &f.data(),
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("nothing in the archive matches"), "{err}");
 }
 
 #[test]

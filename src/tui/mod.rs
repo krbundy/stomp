@@ -139,6 +139,7 @@ fn run_command(app: &App, command: &Command) {
                 overwrite: false,
                 keep_archive: false,
                 delete_remote: false,
+                dry_run: false,
                 yes: false,
                 here: false,
                 task: None,

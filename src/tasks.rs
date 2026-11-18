@@ -287,6 +287,38 @@ pub fn queue_states(jobs: &[String]) -> HashMap<String, String> {
         .collect()
 }
 
+/// An unfinished task of `kind` whose job script mentions `needle` (such as
+/// an archive ID) and whose Slurm job is still queued or running.
+pub fn active_for(data_dir: &Path, kind: &str, needle: &str) -> Option<TaskState> {
+    let candidates: Vec<TaskState> = list(data_dir)
+        .ok()?
+        .into_iter()
+        .filter(|t| {
+            t.kind == kind
+                && !t.status.is_final()
+                && std::fs::read_to_string(task_dir(data_dir, &t.id).join("task.sh"))
+                    .is_ok_and(|script| script.contains(needle))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    if crate::sys::which("squeue").is_none() {
+        // Can't ask Slurm; trust what the task last recorded.
+        return candidates
+            .into_iter()
+            .find(|t| matches!(t.status, Status::Submitted | Status::Running));
+    }
+    let jobs: Vec<String> = candidates
+        .iter()
+        .filter_map(|t| t.slurm_jobs.last().cloned())
+        .collect();
+    let queued = queue_states(&jobs);
+    candidates
+        .into_iter()
+        .find(|t| t.slurm_jobs.last().is_some_and(|j| queued.contains_key(j)))
+}
+
 /// Cancels a task's current Slurm job.
 pub fn cancel(data_dir: &Path, id: &str) -> Result<TaskState> {
     let state = load(data_dir, id)?;

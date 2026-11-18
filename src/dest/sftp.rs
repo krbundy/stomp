@@ -260,7 +260,8 @@ impl Destination for Sftp {
     }
 
     fn list(&self, rel: &str) -> Result<Vec<(String, u64)>> {
-        let out = self.batch(&[format!("ls -ln {}", quote(&self.remote(rel)))])?;
+        // `-ls`: a directory that doesn't exist lists as empty instead of failing.
+        let out = self.batch(&[format!("-ls -ln {}", quote(&self.remote(rel)))])?;
         Ok(out
             .lines()
             .filter(|l| !l.starts_with("sftp>"))
