@@ -217,6 +217,11 @@ pub struct App {
     pub location: Location,
     pub entries: Vec<Entry>,
     pub selected: usize,
+    /// Whether the selection follows its entry when the list is re-sorted.
+    /// A fresh listing keeps the top row selected while sizes arrive, until
+    /// the user moves; otherwise a file, whose size is known at once, would
+    /// start out selected and drift down the list as directories are measured.
+    pub follow: bool,
     pub table: TableState,
     pub sort: Sort,
     pub popup: Option<Popup>,
@@ -272,6 +277,7 @@ impl App {
             location,
             entries: Vec::new(),
             selected: 0,
+            follow: false,
             table: TableState::default(),
             sort: Sort::Size,
             popup: None,
@@ -492,15 +498,23 @@ impl App {
                 t(a).cmp(&t(b)).then_with(|| a.name.cmp(&b.name))
             }),
         }
-        self.selected = keep
-            .and_then(|p| self.entries.iter().position(|e| e.path == p))
-            .unwrap_or(0)
-            .min(self.entries.len().saturating_sub(1));
+        let kept = keep
+            .filter(|_| self.follow)
+            .and_then(|p| self.entries.iter().position(|e| e.path == p));
+        self.selected = kept.unwrap_or(0).min(self.entries.len().saturating_sub(1));
+    }
+
+    /// Moves the selection at the user's request; from then on it follows its entry.
+    fn select(&mut self, i: usize) {
+        self.selected = i;
+        self.follow = true;
     }
 
     fn go(&mut self, location: Location, select: Option<PathBuf>) {
         self.location = location;
         self.selected = 0;
+        // Coming back up lands on the directory we left, and stays on it.
+        self.follow = select.is_some();
         self.table = TableState::default();
         self.load();
         if let Some(p) = select
@@ -795,12 +809,12 @@ impl App {
         let last = self.entries.len().saturating_sub(1);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Some(Command::Quit),
-            KeyCode::Down | KeyCode::Char('j') => self.selected = (self.selected + 1).min(last),
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
-            KeyCode::PageDown => self.selected = (self.selected + self.page).min(last),
-            KeyCode::PageUp => self.selected = self.selected.saturating_sub(self.page),
-            KeyCode::Home => self.selected = 0,
-            KeyCode::End => self.selected = last,
+            KeyCode::Down | KeyCode::Char('j') => self.select((self.selected + 1).min(last)),
+            KeyCode::Up | KeyCode::Char('k') => self.select(self.selected.saturating_sub(1)),
+            KeyCode::PageDown => self.select((self.selected + self.page).min(last)),
+            KeyCode::PageUp => self.select(self.selected.saturating_sub(self.page)),
+            KeyCode::Home => self.select(0),
+            KeyCode::End => self.select(last),
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => self.open(),
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.up(),
             KeyCode::Char('s') => {

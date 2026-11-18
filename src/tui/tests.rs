@@ -82,6 +82,7 @@ fn key(app: &mut App, code: KeyCode) -> Option<Command> {
 
 fn select(app: &mut App, name: &str) {
     app.selected = app.entries.iter().position(|e| e.name == name).unwrap();
+    app.follow = true;
 }
 
 fn names(app: &App) -> Vec<&str> {
@@ -89,7 +90,11 @@ fn names(app: &App) -> Vec<&str> {
 }
 
 fn screen(app: &mut App) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+    screen_sized(app, 140, 30)
+}
+
+fn screen_sized(app: &mut App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|f| view::draw(f, app)).unwrap();
     let buffer = terminal.backend().buffer();
     let mut out = String::new();
@@ -119,6 +124,9 @@ fn lists_measures_and_marks() {
             "archived"
         ]
     );
+    // The top row starts selected, even though the file's size was known
+    // before any directory had been measured.
+    assert_eq!(app.selected_entry().unwrap().name, "alpha");
     let alpha = &app.entries[0];
     assert_eq!(alpha.grant.as_deref(), Some("A"));
     assert_eq!(alpha.usage.unwrap().bytes, 51_010);
@@ -293,4 +301,16 @@ fn draws_the_listing_and_popups() {
 
     key(&mut app, KeyCode::Char('c'));
     assert!(screen(&mut app).contains("No jobs in the last 30 days"));
+}
+
+#[test]
+fn key_hints_fit_narrow_terminals() {
+    let f = Fixture::new();
+    let mut app = f.app();
+    let wide = screen(&mut app);
+    assert!(wide.contains("R refresh  ? help  q quit"), "{wide}");
+    let narrow = screen_sized(&mut app, 80, 24);
+    let footer = narrow.lines().last().unwrap().trim_end();
+    assert!(footer.ends_with("? help  q quit"), "{footer:?}");
+    assert!(footer.starts_with("↑↓ move"), "{footer:?}");
 }

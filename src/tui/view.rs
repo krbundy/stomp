@@ -34,7 +34,36 @@ fn grant_color(app: &App, id: &str) -> Color {
         .map_or(Color::Reset, |i| PALETTE[i % PALETTE.len()])
 }
 
-const KEYS: &str = "↑↓ move  →/⏎ open  ← back  s sort  g grant  i info  e estimate  a archive  r restore  c compute  R refresh  ? help  q quit";
+/// Footer key hints, most useful first; as many as fit are shown.
+const HINTS: [&str; 11] = [
+    "↑↓ move",
+    "→/⏎ open",
+    "← back",
+    "s sort",
+    "g grant",
+    "i info",
+    "e estimate",
+    "a archive",
+    "r restore",
+    "c compute",
+    "R refresh",
+];
+/// Always shown, so a narrow terminal still says how to get help and leave.
+const ALWAYS: &str = "? help  q quit";
+
+/// The key hints that fit in `width` columns, ending with help and quit.
+fn key_hints(width: usize) -> String {
+    let mut out = String::new();
+    for hint in HINTS {
+        let len = out.chars().count() + hint.chars().count() + 2 + ALWAYS.chars().count();
+        if len > width {
+            break;
+        }
+        out.push_str(hint);
+        out.push_str("  ");
+    }
+    out + ALWAYS
+}
 
 const HELP: &str = "\
 Moving
@@ -102,7 +131,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let footer_text = match &app.status {
         Some(s) => Line::from(Span::styled(s.clone(), Style::new().fg(Color::Yellow))),
-        None => Line::from(Span::styled(KEYS, Style::new().fg(Color::DarkGray))),
+        None => Line::from(Span::styled(
+            key_hints(usize::from(footer.width)),
+            Style::new().fg(Color::DarkGray),
+        )),
     };
     frame.render_widget(Paragraph::new(footer_text), footer);
     if let Some(popup) = &app.popup {

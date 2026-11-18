@@ -1104,6 +1104,8 @@ The one exception is `stomp jobs log`, which always exits 0 unless `--strict` is
 
 **Terminal handling.** stomp never asks the terminal for its cursor position, since that question can time out over a slow SSH connection. A panic restores the terminal before its message is printed.
 
+**Selection and key hints.** A fresh listing keeps the top row selected while sizes arrive, until the user moves; after that the selection follows its entry through re-sorts. (Otherwise a file, whose size is known at once, starts out selected and drifts down as directories are measured.) The footer shows as many key hints as fit the width, always ending with `? help  q quit`.
+
 ## 20. Implementation
 
 ### 20.1 Structure
