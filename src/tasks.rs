@@ -336,24 +336,93 @@ pub fn cancel(data_dir: &Path, id: &str) -> Result<TaskState> {
     if state.status.is_final() {
         bail!("task {id} is already {}", state.status.label());
     }
+    // Marked first, so a task stopping on the signal sees it and doesn't
+    // resubmit itself.
+    let before = state.status;
+    let state = update(data_dir, id, |s| s.status = Status::Cancelled)?;
     if let Some(job) = state.slurm_jobs.last() {
-        let output = Command::new("scancel")
-            .arg(job)
-            .output()
-            .context("cannot run scancel")?;
-        if !output.status.success() {
-            bail!(
+        let output = Command::new("scancel").arg(job).output();
+        let failure = match output {
+            Ok(o) if o.status.success() => None,
+            Ok(o) => Some(format!(
                 "scancel failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+            Err(e) => Some(format!("cannot run scancel: {e}")),
+        };
+        if let Some(why) = failure {
+            update(data_dir, id, |s| s.status = before)?;
+            bail!(why);
         }
     }
-    update(data_dir, id, |s| s.status = Status::Cancelled)
+    Ok(state)
+}
+
+/// Whether a task that stopped early should resubmit itself: only when
+/// Slurm warned of its time limit, it wasn't cancelled, and resubmitting is
+/// on and not used up.
+pub fn should_resubmit(cfg: &crate::config::Config, state: &TaskState, time_limit: bool) -> bool {
+    time_limit
+        && state.status != Status::Cancelled
+        && cfg.slurm.auto_resubmit.unwrap_or(true)
+        && state.resubmits < MAX_RESUBMITS
+}
+
+/// The arguments a task's job script passes to stomp, after `--config FILE`.
+pub fn script_args(data_dir: &Path, id: &str) -> Vec<String> {
+    let Ok(script) = std::fs::read_to_string(task_dir(data_dir, id).join("task.sh")) else {
+        return Vec::new();
+    };
+    let Some(line) = script.lines().find(|l| l.starts_with("exec ")) else {
+        return Vec::new();
+    };
+    // Every word is single-quoted, with ' written as '\''.
+    let mut words = Vec::new();
+    let mut rest = line;
+    while let Some(start) = rest.find('\'') {
+        let mut word = String::new();
+        let mut tail = &rest[start + 1..];
+        loop {
+            let Some(end) = tail.find('\'') else {
+                return Vec::new();
+            };
+            word.push_str(&tail[..end]);
+            tail = &tail[end + 1..];
+            match tail.strip_prefix("\\''") {
+                Some(more) => {
+                    word.push('\'');
+                    tail = more;
+                }
+                None => break,
+            }
+        }
+        words.push(word);
+        rest = tail;
+    }
+    // The quoted words are [exe, config file, args...]; `--config` itself isn't quoted.
+    words.into_iter().skip(2).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_scripts_arguments_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = task_dir(tmp.path(), "archive-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("task.sh"),
+            "#!/bin/bash\nexec '/u/bin/stomp' --config '/u/c.toml' 'archive' '/u/it'\\''s here' '--yes'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script_args(tmp.path(), "archive-1"),
+            ["archive", "/u/it's here", "--yes"]
+        );
+        assert!(script_args(tmp.path(), "nope").is_empty());
+    }
 
     #[test]
     fn renders_script_with_overrides_and_quoting() {

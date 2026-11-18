@@ -213,10 +213,13 @@ pub fn restore_plan(
             !archive_dir.join(&name).exists() && !scratch.join(&name).exists()
         })
         .count();
+    // Directories are counted as the restore counts them: the ones selected
+    // and the ones holding the selection, which it recreates too.
+    plan.dirs = wanted.values().filter(|r| r.kind == Kind::Dir).count() as u64;
     for (rel, r) in &selected {
         let target = dest.join(rel);
         match r.kind {
-            Kind::Dir => plan.dirs += 1,
+            Kind::Dir => {}
             Kind::Symlink | Kind::Hardlink => plan.links += 1,
             Kind::File => {
                 plan.files += 1;

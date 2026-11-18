@@ -94,9 +94,11 @@ pub fn run(cfg: &Config, config_path: &Path, data_dir: &Path, args: Args) -> Res
             match &args.task {
                 Some(id) => {
                     let mut state = tasks::load(data_dir, id)?;
-                    if cfg.slurm.auto_resubmit.unwrap_or(true)
-                        && state.resubmits < tasks::MAX_RESUBMITS
-                    {
+                    if state.status == Status::Cancelled {
+                        println!(
+                            "Scan {text}. The task was cancelled; `stomp scan --resume` continues it."
+                        );
+                    } else if tasks::should_resubmit(cfg, &state, progress::time_limit_reached()) {
                         let job = tasks::resubmit(data_dir, &mut state)?;
                         println!("Scan {text}. Resubmitted as Slurm job {job} to continue.");
                     } else {

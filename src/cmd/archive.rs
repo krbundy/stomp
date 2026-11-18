@@ -555,7 +555,9 @@ fn continue_or_resubmit(
     match task {
         Some(id) => {
             let mut state = tasks::load(data_dir, id)?;
-            if cfg.slurm.auto_resubmit.unwrap_or(true) && state.resubmits < tasks::MAX_RESUBMITS {
+            if state.status == Status::Cancelled {
+                println!("{text}. The task was cancelled; continue with `{command}`.");
+            } else if tasks::should_resubmit(cfg, &state, progress::time_limit_reached()) {
                 let job = tasks::resubmit(data_dir, &mut state)?;
                 println!("{text}. Resubmitted as Slurm job {job} to continue.");
             } else {
@@ -1132,9 +1134,23 @@ pub fn move_archive(
         bail!("archive {} is already at {}", settings.id, args.to);
     }
     if args.task.is_none() && !args.yes {
+        let place = |d: &str| {
+            if d == LOCAL_DESTINATION {
+                "its directory".to_string()
+            } else {
+                d.to_string()
+            }
+        };
         println!(
-            "Move archive {} from {} to {}. Each chunk is verified at {} before any copy is removed.",
-            settings.id, settings.destination, args.to, args.to
+            "Move archive {} from {} to {}. Each chunk is verified {} before any copy is removed.",
+            settings.id,
+            place(&settings.destination),
+            place(&args.to),
+            if args.to == LOCAL_DESTINATION {
+                "in the directory".to_string()
+            } else {
+                format!("at {}", args.to)
+            }
         );
         if !confirm("Move it?")? {
             println!("Nothing was changed.");
@@ -1260,7 +1276,7 @@ fn print_restore_plan(
         "  chunks        {:>8}{}",
         plan.chunks,
         match (&from, plan.downloads) {
-            (Some(dest), n) if n > 0 => format!("   ({n} downloaded from {dest})"),
+            (Some(dest), n) if n > 0 => format!("   ({n} to download from {dest})"),
             _ => String::new(),
         }
     );

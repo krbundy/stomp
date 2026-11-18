@@ -3,12 +3,24 @@
 
 use std::io::IsTerminal;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1};
+
+/// Set by USR1 only: Slurm's warning that the time limit is near.
+static TIME_LIMIT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// Whether work stopped because the time limit was near (USR1), the one case
+/// where a task resubmits itself. TERM (`scancel`, `stomp tasks cancel`) and
+/// Ctrl-C stop it for good.
+pub fn time_limit_reached() -> bool {
+    TIME_LIMIT
+        .get()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
 
 /// A flag set by the signals that should stop work cleanly: USR1, which Slurm
 /// sends shortly before a task's time limit (§14.2), TERM and Ctrl-C.
@@ -17,6 +29,8 @@ pub fn stop_flag() -> Result<Arc<AtomicBool>> {
     for signal in [SIGUSR1, SIGTERM, SIGINT] {
         signal_hook::flag::register(signal, Arc::clone(&stop))?;
     }
+    let time_limit = TIME_LIMIT.get_or_init(|| Arc::new(AtomicBool::new(false)));
+    signal_hook::flag::register(SIGUSR1, Arc::clone(time_limit))?;
     Ok(stop)
 }
 

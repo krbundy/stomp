@@ -165,7 +165,8 @@ pub fn history(
                 }
                 doc.text(&note);
             }
-            print!("{}", doc.render(markdown));
+            // Without the measurements table, the TB-months heading comes first.
+            print!("{}", doc.render(markdown).trim_start_matches('\n'));
         }
     }
     Ok(())
