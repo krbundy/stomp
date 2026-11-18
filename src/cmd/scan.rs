@@ -155,7 +155,10 @@ fn describe(s: &Summary) -> String {
         format_duration(s.seconds)
     );
     if s.reused > 0 {
-        text += &format!("; {} unchanged directories reused", format_count(s.reused));
+        text += &format!(
+            "; {} reused",
+            counted(s.reused, "unchanged directory", "unchanged directories")
+        );
     }
     if s.resumed {
         text += "; resumed an interrupted scan";

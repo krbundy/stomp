@@ -375,6 +375,24 @@ fn interrupted_scan_is_left_in_the_inbox_and_resumed() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].meta.status, "incomplete");
 
+    // Nothing is running it, so it counts as interrupted.
+    assert!(pending[0].is_interrupted() && !pending[0].is_running());
+
+    // While another scan holds it (as a running one does), it isn't
+    // interrupted, and resuming it is refused rather than writing it twice.
+    {
+        let _held = super::result::lock_result(&pending[0].path)
+            .unwrap()
+            .unwrap();
+        assert!(pending[0].is_running() && !pending[0].is_interrupted());
+        stop.store(false, Ordering::SeqCst);
+        let err = run(&cfg, &data, &request, &stop, &Progress::default())
+            .err()
+            .expect("a running scan isn't resumed")
+            .to_string();
+        assert!(err.contains("still running"), "{err}");
+    }
+
     // Importing leaves it alone; the same task resumes it.
     Catalog::open(&data).unwrap().ingest(&data).unwrap();
     assert_eq!(list_results(&inbox_dir(&data)).unwrap().len(), 1);

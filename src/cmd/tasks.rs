@@ -77,7 +77,7 @@ pub fn list(data_dir: &Path, format: Format) -> Result<()> {
 
     let pending = scan::list_results(&scan::inbox_dir(data_dir))?
         .into_iter()
-        .filter(|r| r.meta.status != "complete")
+        .filter(|r| r.is_interrupted())
         .count();
     if matches!(format, Format::Table | Format::Md) {
         if rows.is_empty() {

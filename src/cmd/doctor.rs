@@ -163,14 +163,21 @@ fn check_state(r: &mut Report, data_dir: &Path) {
         }
     }
     if let Ok(results) = scan::list_results(&scan::inbox_dir(data_dir)) {
-        let (done, interrupted): (Vec<_>, Vec<_>) =
-            results.iter().partition(|r| r.meta.status == "complete");
-        if !done.is_empty() {
+        let done = results
+            .iter()
+            .filter(|r| r.meta.status == "complete")
+            .count();
+        let running = results.iter().filter(|r| r.is_running()).count();
+        let interrupted: Vec<_> = results.iter().filter(|r| r.is_interrupted()).collect();
+        if done > 0 {
             r.line(
                 Status::Info,
                 "scans",
-                format!("{} finished scan(s) waiting to be imported", done.len()),
+                format!("{done} finished scan(s) waiting to be imported; `stomp ingest`, `stomp tasks` or any report imports them"),
             );
+        }
+        if running > 0 {
+            r.line(Status::Info, "scans", format!("{running} scan(s) running"));
         }
         if !interrupted.is_empty() {
             r.line(

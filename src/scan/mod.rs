@@ -14,12 +14,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::types::Value;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-pub use result::{Meta, ResultInfo, list_results};
+pub use result::{Meta, ResultInfo, list_results, lock_path};
 
 use crate::catalog;
 use crate::config::Config;
@@ -265,9 +265,26 @@ pub fn run(
     } else {
         None
     };
+    // Held while this scan writes its result, so nothing resumes it twice
+    // and `stomp tasks` can tell it's running, not interrupted.
+    let _lock;
     let resumed = resumable.is_some();
     let (db, meta) = match resumable {
         Some(found) => {
+            _lock = result::lock_result(&found.path)?.with_context(|| {
+                format!(
+                    "the scan started {} is still running{}; let it finish, or cancel it first",
+                    crate::cmd::local_time(
+                        jiff::Timestamp::from_second(found.meta.started_at).unwrap_or_default()
+                    ),
+                    found
+                        .meta
+                        .task_id
+                        .as_deref()
+                        .map(|t| format!(" (task {t}; `stomp tasks cancel {t}`)"))
+                        .unwrap_or_default()
+                )
+            })?;
             let (db, mut meta) = ResultDb::open(&found.path)?;
             // File statistics from before the interruption were held in memory and lost.
             meta.file_stats = false;
@@ -277,7 +294,9 @@ pub fn run(
         }
         None => {
             let meta = new_meta(cfg, data_dir, req)?;
-            let db = ResultDb::create(&inbox.join(format!("{}.db", meta.uuid)), &meta)?;
+            let path = inbox.join(format!("{}.db", meta.uuid));
+            _lock = result::lock_result(&path)?.context("a new scan's result file is locked")?;
+            let db = ResultDb::create(&path, &meta)?;
             (db, meta)
         }
     };

@@ -294,6 +294,49 @@ pub struct ResultInfo {
     pub meta: Meta,
 }
 
+impl ResultInfo {
+    /// Whether a scan is writing this result right now. A result left
+    /// unfinished by a scan that stopped (or died) isn't.
+    pub fn is_running(&self) -> bool {
+        let Ok(file) = std::fs::File::open(lock_path(&self.path)) else {
+            return false; // never locked, or already imported
+        };
+        matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    }
+
+    /// Unfinished, and no scan is working on it: `stomp scan --resume` can continue it.
+    pub fn is_interrupted(&self) -> bool {
+        self.meta.status != "complete" && !self.is_running()
+    }
+}
+
+/// The file a running scan keeps locked beside its result file. flock works
+/// across CephFS clients, so this holds wherever the scan runs, and the lock
+/// goes when the process does, however it ends.
+pub fn lock_path(result: &Path) -> PathBuf {
+    result.with_extension("lock")
+}
+
+/// Held for as long as a scan writes a result file.
+pub struct RunLock(#[allow(dead_code)] std::fs::File);
+
+/// Takes the run lock on a result file; `None` if another scan holds it.
+pub fn lock_result(result: &Path) -> Result<Option<RunLock>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(lock_path(result))
+        .context("cannot create the scan's lock file")?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(RunLock(file))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
 /// Result files in the inbox, oldest first. Unreadable files are skipped.
 pub fn list_results(inbox: &Path) -> Result<Vec<ResultInfo>> {
     let entries = match std::fs::read_dir(inbox) {

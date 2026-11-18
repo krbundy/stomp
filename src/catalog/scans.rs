@@ -68,6 +68,7 @@ fn one_scan(
 /// Deletes a result file and the journal SQLite keeps beside it.
 fn remove_result(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)?;
+    let _ = std::fs::remove_file(crate::scan::lock_path(path));
     let mut journal = path.as_os_str().to_owned();
     journal.push("-journal");
     match std::fs::remove_file(PathBuf::from(journal)) {
