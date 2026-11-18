@@ -205,3 +205,19 @@ fn sftp_only_server_is_verified_by_reading_back() {
         "{checks:?}"
     );
 }
+
+#[test]
+fn home_relative_paths_mean_the_servers_home() {
+    let user = std::env::var("USER").unwrap_or_default();
+    // `~` is the home directory on the server: a path relative to where sftp logs in.
+    assert_eq!(
+        super::remote_base("~/archive/$USER/").unwrap(),
+        format!("archive/{user}")
+    );
+    assert_eq!(super::remote_base("~").unwrap(), ".");
+    assert_eq!(
+        super::remote_base("/archive/data/").unwrap(),
+        "/archive/data"
+    );
+    assert!(super::remote_base("~/x/$NO_SUCH_VARIABLE_HERE").is_err());
+}

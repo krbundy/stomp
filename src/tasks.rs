@@ -27,6 +27,9 @@ pub enum Status {
     /// Stopped early and not resubmitted; its saved progress can be resumed.
     Incomplete,
     Done,
+    /// Finished, but left some things undone on purpose (a restore that
+    /// didn't replace existing files); the message says what.
+    Partial,
     Failed,
     Cancelled,
 }
@@ -38,13 +41,17 @@ impl Status {
             Status::Running => "running",
             Status::Incomplete => "incomplete",
             Status::Done => "done",
+            Status::Partial => "partial",
             Status::Failed => "failed",
             Status::Cancelled => "cancelled",
         }
     }
 
     pub fn is_final(self) -> bool {
-        matches!(self, Status::Done | Status::Failed | Status::Cancelled)
+        matches!(
+            self,
+            Status::Done | Status::Partial | Status::Failed | Status::Cancelled
+        )
     }
 }
 
@@ -85,9 +92,13 @@ pub fn progress_path(data_dir: &Path, id: &str) -> PathBuf {
 
 fn new_id(kind: &str) -> String {
     let now = jiff::Timestamp::now();
+    // Local time, like every other time stomp shows.
+    let stamp = now
+        .to_zoned_datetime(jiff::tz::TimeZone::system())
+        .strftime("%Y%m%d-%H%M%S")
+        .to_string();
     format!(
-        "{kind}-{}-{:04x}",
-        now.strftime("%Y%m%d-%H%M%S"),
+        "{kind}-{stamp}-{:04x}",
         (now.subsec_nanosecond() as u32 ^ std::process::id()) & 0xffff
     )
 }

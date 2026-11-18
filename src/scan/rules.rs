@@ -11,11 +11,16 @@ use crate::fs::Entry;
 use crate::paths;
 
 /// Known package and container caches, relative to the home directory.
-pub const KNOWN_CACHES: [&str; 4] = [
+pub const KNOWN_CACHES: [&str; 8] = [
     ".cache",
     ".apptainer/cache",
     ".singularity/cache",
     ".conda/pkgs",
+    // conda's package cache inside the usual installs.
+    "miniconda3/pkgs",
+    "anaconda3/pkgs",
+    "miniforge3/pkgs",
+    "mambaforge/pkgs",
 ];
 
 pub struct Rules {
@@ -79,11 +84,49 @@ impl Rules {
     /// Whether a directory's entries mark it as a software environment: an
     /// Apptainer/Singularity sandbox, a conda environment or a Python venv.
     pub fn is_environment(entries: &[Entry]) -> bool {
-        entries.iter().any(|e| {
+        Self::environment_kind(entries).is_some()
+    }
+
+    /// Which kind of software environment a directory's entries mark it as.
+    pub fn environment_kind(entries: &[Entry]) -> Option<Environment> {
+        entries.iter().find_map(|e| {
             let name = e.path.file_name().unwrap_or_default();
-            (e.md.is_dir() && (name == ".singularity.d" || name == "conda-meta"))
-                || (e.md.is_file() && name == "pyvenv.cfg")
+            if e.md.is_dir() && name == ".singularity.d" {
+                Some(Environment::Apptainer)
+            } else if e.md.is_dir() && name == "conda-meta" {
+                Some(Environment::Conda)
+            } else if e.md.is_file() && name == "pyvenv.cfg" {
+                Some(Environment::Venv)
+            } else {
+                None
+            }
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Environment {
+    Apptainer,
+    Conda,
+    Venv,
+}
+
+impl Environment {
+    /// How to make the environment smaller or rebuildable, for `dir`.
+    pub fn hint(self, dir: &str) -> String {
+        match self {
+            Environment::Apptainer => {
+                format!(
+                    "an Apptainer sandbox can be turned into one file with `apptainer build image.sif {dir}`"
+                )
+            }
+            Environment::Conda => format!(
+                "a conda environment can be rebuilt from `conda env export --prefix {dir} > environment.yml`"
+            ),
+            Environment::Venv => format!(
+                "a Python venv can be rebuilt from `{dir}/bin/pip freeze > requirements.txt`"
+            ),
+        }
     }
 }
 

@@ -18,7 +18,7 @@ use crate::dest::{self, Destination};
 use crate::scan::rules::Rules;
 use crate::table::{Align, Table};
 use crate::tasks::{self, Overrides, Status};
-use crate::units::{format_bytes, format_count, format_duration, parse_size};
+use crate::units::{counted, format_bytes, format_count, format_duration, parse_size};
 use crate::{compute, fs, jobs, paths, sys};
 
 pub struct ArchiveArgs {
@@ -54,7 +54,14 @@ pub fn archive(
         .clone()
         .unwrap_or_else(|| cfg.archive.default_destination.clone());
     if destination != LOCAL_DESTINATION {
-        dest::open(cfg, &destination)?; // a clear error now rather than in the task
+        if args.dry_run || args.estimate {
+            // Planning never contacts the destination, so it needn't be able to.
+            if !cfg.destinations.iter().any(|d| d.name() == destination) {
+                dest::open(cfg, &destination)?; // says what's configured instead
+            }
+        } else {
+            dest::open(cfg, &destination)?; // a clear error now rather than in the task
+        }
     }
 
     // An archive to continue: named by a task's --id, or found by --resume.
@@ -483,12 +490,12 @@ fn run_archive(
         }
         Ok(Outcome::Complete(sum)) => {
             let mut text = format!(
-                "Archived {}: {} files ({}) compressed to {} in {} chunk(s), in {}.",
+                "Archived {}: {} ({}) compressed to {} in {}, in {}.",
                 paths::display(&s.source),
-                format_count(sum.files),
+                counted(sum.files, "file", "files"),
                 format_bytes(sum.bytes),
                 format_bytes(sum.compressed),
-                sum.chunks,
+                counted(sum.chunks.into(), "chunk", "chunks"),
                 format_duration(sum.seconds)
             );
             if sum.kept > 0 {
@@ -1067,7 +1074,11 @@ pub fn restore(
             match &args.task {
                 Some(id) => {
                     tasks::update(data_dir, id, |t| {
-                        t.status = Status::Done;
+                        t.status = if summary.conflicts.is_empty() {
+                            Status::Done
+                        } else {
+                            Status::Partial
+                        };
                         t.message = Some(text);
                     })?;
                 }
@@ -1296,11 +1307,11 @@ fn print_restore_plan(
 
 fn describe_restore(s: &RestoreSummary, into: &Path, id: &str) -> String {
     let mut text = format!(
-        "Restored {} files ({}), {} links and {} directories into {}.",
-        format_count(s.files),
+        "Restored {} ({}), {} and {} into {}.",
+        counted(s.files, "file", "files"),
         format_bytes(s.bytes),
-        format_count(s.links),
-        format_count(s.dirs),
+        counted(s.links, "link", "links"),
+        counted(s.dirs, "directory", "directories"),
         paths::display(into)
     );
     if !s.conflicts.is_empty() {

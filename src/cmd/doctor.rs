@@ -91,6 +91,9 @@ fn check_config(r: &mut Report, config_path: &Path) -> Option<Config> {
             for problem in &e.problems {
                 r.line(Status::Fail, "config", format!("{shown}: {problem}"));
             }
+            for w in &e.warnings {
+                r.line(Status::Warn, "config", w);
+            }
             None
         }
     }
@@ -155,7 +158,7 @@ fn check_state(r: &mut Report, data_dir: &Path) {
             r.line(
                 Status::Info,
                 topic,
-                format!("{n} {what} waiting to be imported; any other command imports them"),
+                format!("{n} {what} waiting to be imported; `stomp ingest`, `stomp tasks` or any report imports them"),
             );
         }
     }

@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::scan::walk::Progress;
 use crate::scan::{self, Outcome, Request, Summary};
 use crate::tasks::{self, Overrides, Status};
-use crate::units::{format_bytes, format_count, format_duration};
+use crate::units::{counted, format_bytes, format_count, format_duration};
 
 pub struct Args {
     pub full: bool,
@@ -28,7 +28,7 @@ pub fn run(cfg: &Config, config_path: &Path, data_dir: &Path, args: Args) -> Res
     }
     if args.here && !in_job {
         eprintln!(
-            "stomp: scanning here instead of in a Slurm task. On a shared login node, please keep this to small trees."
+            "stomp: scanning here instead of in a Slurm task. This walks every root in your config; on a shared login node, keep that to small ones."
         );
     }
 
@@ -136,7 +136,7 @@ fn submit(cfg: &Config, config_path: &Path, data_dir: &Path, args: &Args) -> Res
         state.slurm_jobs.first().map_or("?", String::as_str)
     );
     println!(
-        "Follow it with `stomp tasks`. The results are imported the next time you run stomp after it finishes."
+        "Follow it with `stomp tasks`; once it's done, that (or any report) imports the results."
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -148,9 +148,9 @@ fn describe(s: &Summary) -> String {
         "incremental scan"
     };
     let mut text = format!(
-        "{kind}, {} directories and {} files ({}) in {}",
-        format_count(s.dirs),
-        format_count(s.files),
+        "{kind}, {} and {} ({}) in {}",
+        counted(s.dirs, "directory", "directories"),
+        counted(s.files, "file", "files"),
         format_bytes(s.bytes),
         format_duration(s.seconds)
     );

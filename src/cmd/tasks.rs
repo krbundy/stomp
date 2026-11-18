@@ -47,6 +47,9 @@ fn shown_status(task: &TaskState, queue: Option<&String>) -> String {
 }
 
 pub fn list(data_dir: &Path, format: Format) -> Result<()> {
+    // This is where people look once a task is done, so its results are
+    // imported here too. Best effort: the listing matters more.
+    let _ = super::open_catalog(data_dir);
     let all = tasks::list(data_dir)?;
     let active: Vec<String> = all
         .iter()
@@ -120,8 +123,8 @@ pub fn show(data_dir: &Path, id: &str) -> Result<()> {
         "Status    {}",
         shown_status(&task, task.slurm_jobs.last().and_then(|j| queue.get(j)))
     );
-    println!("Created   {}", task.created_at);
-    println!("Updated   {}", task.updated_at);
+    println!("Created   {}", short_local(&task.created_at));
+    println!("Updated   {}", short_local(&task.updated_at));
     println!("Jobs      {}", task.slurm_jobs.join(", "));
     if task.resubmits > 0 {
         println!("Resubmits {}", task.resubmits);

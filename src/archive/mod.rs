@@ -208,10 +208,11 @@ pub fn check_target(cfg: &Config, dir: &Path, data_dir: &Path, resuming: bool) -
         bail!("{shown} contains stomp's own data directory");
     }
     if let Ok((entries, _)) = crate::fs::read_entries(dir)
-        && Rules::is_environment(&entries)
+        && let Some(kind) = Rules::environment_kind(&entries)
     {
         bail!(
-            "{shown} is a software environment; stomp doesn't archive these (an Apptainer sandbox can be turned into one file with `apptainer build image.sif {shown}`)"
+            "{shown} is a software environment; stomp doesn't archive these ({})",
+            kind.hint(&shown)
         );
     }
     if !resuming && dir.join(NOTE_FILE).exists() {

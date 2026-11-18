@@ -230,8 +230,8 @@ enum Command {
     /// Archive directories proposed by `stomp candidates`
     ///
     /// Each proposal is checked again first: it must still exist and still
-    /// match its policy (on CephFS, nothing in it may have changed since the
-    /// scan). Each archive then runs as its own Slurm task.
+    /// match its policy (on CephFS, by its current size, file count and change
+    /// time, not the scan's). Each archive then runs as its own Slurm task.
     Apply {
         /// Proposal IDs, as `stomp candidates` lists them
         ids: Vec<i64>,
@@ -535,6 +535,7 @@ enum JobsCommand {
 }
 
 pub fn run() -> ExitCode {
+    quiet_broken_pipe();
     let args: Vec<OsString> = std::env::args_os().collect();
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
@@ -559,6 +560,26 @@ pub fn run() -> ExitCode {
             }
         }
     }
+}
+
+/// When stdout is a pipe that closed early (`stomp jobs list | head`), stomp
+/// stops quietly, as command-line tools do, instead of with a panic message.
+/// Resetting SIGPIPE would do it too, but could also silently kill an archive
+/// task when an `sftp` it's feeding exits.
+fn quiet_broken_pipe() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if message.starts_with("failed printing to stdout") && message.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default(info);
+    }));
 }
 
 fn is_lenient_jobs_log(args: &[OsString]) -> bool {
@@ -587,13 +608,19 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         } => {
             if submit {
                 let cfg = load_config(&config_path)?;
+                // The checks take seconds: a small job starts sooner than one
+                // asking for the `[slurm]` settings meant for scans and archives.
+                let mut overrides = slurm.overrides();
+                overrides.time.get_or_insert_with(|| "00:10:00".into());
+                overrides.cpus.get_or_insert(1);
+                overrides.mem.get_or_insert_with(|| "1G".into());
                 let state = crate::tasks::submit(
                     &cfg,
                     &config_path,
                     &data_dir,
                     "doctor",
                     &["doctor".to_string()],
-                    &slurm.overrides(),
+                    &overrides,
                 )?;
                 println!(
                     "Submitted the checks as Slurm job {}. When it finishes, `stomp tasks show {}` points to the output.",

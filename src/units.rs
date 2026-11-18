@@ -6,6 +6,11 @@ use anyhow::{Context, Result, bail};
 
 const IEC_UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
 
+/// A count with its noun, singular or plural: `1 directory`, `36 files`.
+pub fn counted(n: u64, one: &str, many: &str) -> String {
+    format!("{} {}", format_count(n), if n == 1 { one } else { many })
+}
+
 /// For `serialize_with`: hours, costs and the like, rounded to two decimals,
 /// so CSV and JSON don't show float noise such as `92.17999999999999`.
 pub fn round2<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {

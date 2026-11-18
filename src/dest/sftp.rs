@@ -47,6 +47,27 @@ fn quote(path: &str) -> String {
 }
 
 /// Quotes a word for the remote shell.
+/// The destination's base path on the server. `~` there means the home
+/// directory on the server, not on the cluster: it becomes a relative path,
+/// which sftp and ssh both resolve from where they log in. `$VAR`s are
+/// expanded here, so `$USER` works.
+fn remote_base(path: &str) -> Result<String> {
+    let (home_relative, rest) = match path {
+        "~" => (true, ""),
+        _ => match path.strip_prefix("~/") {
+            Some(rest) => (true, rest),
+            None => (false, path),
+        },
+    };
+    let expanded = crate::paths::expand(rest)?;
+    let base = expanded.to_string_lossy().trim_end_matches('/').to_string();
+    Ok(match (home_relative, base.is_empty()) {
+        (true, true) => ".".to_string(),
+        (true, false) => base,
+        (false, _) => base,
+    })
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
@@ -57,10 +78,7 @@ fn parent(path: &str) -> &str {
 
 impl Sftp {
     pub fn new(cfg: &SftpDestination) -> Result<Sftp> {
-        let base = crate::paths::expand(&cfg.path)?
-            .to_string_lossy()
-            .trim_end_matches('/')
-            .to_string();
+        let base = remote_base(&cfg.path)?;
         Ok(Sftp {
             name: cfg.name.clone(),
             host: cfg.host.clone(),

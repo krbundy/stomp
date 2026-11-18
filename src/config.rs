@@ -142,8 +142,6 @@ struct RawGrant {
     end: Option<toml::value::Datetime>,
     #[serde(default)]
     dirs: Vec<String>,
-    #[allow(dead_code)] // used from milestone M2
-    track_files: Option<bool>,
 }
 
 /// Settings for the Slurm tasks stomp submits (§14).
@@ -356,6 +354,9 @@ pub struct GrantDir {
 pub struct ConfigError {
     pub path: PathBuf,
     pub problems: Vec<String>,
+    /// Warnings found alongside the problems, so fixing one round of
+    /// problems doesn't reveal another.
+    pub warnings: Vec<String>,
 }
 
 impl ConfigError {
@@ -363,6 +364,7 @@ impl ConfigError {
         Self {
             path: path.to_path_buf(),
             problems: vec![problem.into()],
+            warnings: Vec::new(),
         }
     }
 }
@@ -371,15 +373,18 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let file = paths::display(&self.path);
         match self.problems.as_slice() {
-            [one] => write!(f, "{file}: {one}"),
+            [one] => write!(f, "{file}: {one}")?,
             many => {
                 write!(f, "{file} has {} problems:", many.len())?;
                 for p in many {
                     write!(f, "\n  - {p}")?;
                 }
-                Ok(())
             }
         }
+        for w in &self.warnings {
+            write!(f, "\n  warning: {w}")?;
+        }
+        Ok(())
     }
 }
 
@@ -414,6 +419,7 @@ impl Config {
             Err(ConfigError {
                 path: source.to_path_buf(),
                 problems: v.errors,
+                warnings: v.warnings,
             })
         }
     }
@@ -798,10 +804,22 @@ impl Validator {
                     if s.path.is_empty() {
                         self.error(format!("destination {name}: path must not be empty"));
                     }
+                    if s.parallel_uploads.is_some() {
+                        self.warn(format!(
+                            "destination {name}: parallel_uploads has no effect on SFTP destinations, which upload one file at a time"
+                        ));
+                    }
                 }
                 Destination::S3(s) => {
                     if s.bucket.is_empty() {
                         self.error(format!("destination {name}: bucket must not be empty"));
+                    }
+                    if let Some(class) = &s.storage_class
+                        && class != "STANDARD"
+                    {
+                        self.error(format!(
+                            "destination {name}: storage_class {class:?} isn't supported yet; only \"STANDARD\" (cold classes such as GLACIER need thawing before a restore, which stomp doesn't do yet)"
+                        ));
                     }
                 }
             }

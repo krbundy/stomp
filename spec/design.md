@@ -245,7 +245,7 @@ bucket   = "my-lab-archive"
 prefix   = "stomp/$USER"
 profile  = "spaces"                    # profile in ~/.aws/credentials holding the Spaces key
 # force_path_style = true              # needed by some other S3-compatible services
-# storage_class = "STANDARD"           # AWS only; cold classes are deferred (§13.3.5)
+# storage_class = "STANDARD"           # the only class accepted; cold classes are deferred (§13.3.5)
 parallel_uploads = 4
 verify = "server-checksum"             # "server-checksum" | "readback" | "size"
 
@@ -405,7 +405,7 @@ Incremental scans don't walk unchanged subtrees, and a resumed scan has lost the
 | Kind | Detected by |
 |------|-------------|
 | environment | a `.singularity.d/` entry (Apptainer/Singularity sandbox), `conda-meta/` (conda env) or `pyvenv.cfg` (venv) |
-| cache | known paths: `~/.cache`, `~/.apptainer/cache`, `~/.singularity/cache`, `~/.conda/pkgs` |
+| cache | known paths: `~/.cache`, `~/.apptainer/cache`, `~/.singularity/cache`, `~/.conda/pkgs`, and `pkgs` inside `~/miniconda3`, `~/anaconda3`, `~/miniforge3` and `~/mambaforge` |
 | user | glob patterns in `scan.exclude` |
 | stomp | stomp's own data directory and staging directory |
 
@@ -731,7 +731,7 @@ Spaces is the first S3 service stomp targets, because the user already keeps dat
 
 A destination that works from a login node may not work from a compute node. For example, AWS endpoints need outbound internet access, which many clusters block on compute nodes.
 
-- `stomp doctor --submit` runs the checks, destinations included, in a short task on a compute node.
+- `stomp doctor --submit` runs the checks, destinations included, in a short task on a compute node (1 CPU, 1 GB, 10 minutes unless overridden, so it starts quickly).
 - If a destination can't be reached from compute nodes, the work splits in two:
   1. Archive locally in a task (`stomp archive DIR --to local`).
   2. From a login or data-transfer node, run `stomp archives move <ID> --to <destination> --here`. This step mostly waits on the network rather than the CPU.
@@ -794,7 +794,8 @@ Finalized → upload README, SHA256SUMS, then the manifest last → Finished
 - **Uploads:** each file goes to `<file>.partial`, is verified, then renamed into place.
 - **Verification:** `verify` defaults to automatic: `sha256sum` over SSH, and if the server refuses commands, reading the file back. Setting `remote-sha256` makes a refusal an error; `size` checks the size alone.
 - **Interrupted uploads start over.** A `.partial` file is always rewritten, which is simple and safe.
-- **One stream:** each upload uses a single SFTP stream; `parallel_uploads` applies to S3 only.
+- **One stream:** each upload uses a single SFTP stream; `parallel_uploads` applies to S3 only, and setting it on an SFTP destination is a warning.
+- **`~` in `path` is the server's home directory**, not the cluster's: it becomes a path relative to where sftp and ssh log in. `$VAR`s are expanded locally.
 - **Testing:** commands and output parsing are tested against stand-in `sftp`/`ssh` programs. Behavior against a real OpenSSH server, such as quoting edge cases, is still to be confirmed on the NAS.
 
 #### Restore
@@ -836,7 +837,7 @@ Finalized → upload README, SHA256SUMS, then the manifest last → Finished
 
 ### 14.3 Task tracking
 
-`stomp tasks` lists submitted tasks with their state (from `squeue` and `sacct`) and progress (from the task's journal). `stomp tasks cancel <id>` cancels one.
+`stomp tasks` lists submitted tasks with their state (from `squeue` and `sacct`) and progress (from the task's journal), and imports the results of finished ones. A restore that left existing files alone ends as `partial`. `stomp tasks cancel <id>` cancels one and says how to continue (or, for an archive, undo) it. Task IDs carry the local time they were created.
 
 ### 14.4 Recurring work
 
@@ -1044,6 +1045,10 @@ TOTAL           516      21,426        624
 | 3 | Partial success; details in the output |
 
 The one exception is `stomp jobs log`, which always exits 0 unless `--strict` is given (§15.1).
+
+**Pipes.** When stdout is a pipe that closes early (`stomp jobs list | head`), stomp stops quietly with status 0. It does this in a panic hook rather than by restoring the default SIGPIPE action, which could kill an archive task silently when an `sftp` it feeds exits.
+
+**Config problems** are listed together with the config's warnings, so fixing one round doesn't reveal another.
 
 ## 18. Reports
 

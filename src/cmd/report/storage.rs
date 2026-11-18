@@ -151,8 +151,8 @@ fn suggestion(kind: ExcludeKind, path: &Path) -> String {
             let p = path.to_string_lossy();
             if p.ends_with(".apptainer/cache") || p.ends_with(".singularity/cache") {
                 "apptainer cache clean".to_string()
-            } else if p.ends_with(".conda/pkgs") {
-                "conda clean --all".to_string()
+            } else if p.ends_with("/pkgs") {
+                "conda's package cache: `conda clean --all`".to_string()
             } else {
                 "usually safe to clear; check what's in it first (pip: pip cache purge)".to_string()
             }
