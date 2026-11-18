@@ -523,16 +523,20 @@ pub fn note_text(
         None => format!(
             "This directory is being archived by stomp (archive {id}), started {created} by {user}.
 
-Files are packed into compressed chunks ({location}) and the
-originals are removed one chunk at a time, after each chunk has been verified
-where it is stored. If archiving stops partway, everything already removed is
-safe in those chunks.
+Files are packed into compressed chunks and the originals are removed one
+chunk at a time, after each chunk has been verified where it's stored. If
+archiving stops partway, everything already removed is safe in those chunks.
 
+Chunks:                 {stored}
 To continue:            stomp archive --resume {dir}
-To put everything back: stomp restore {id}
+To put everything back: stomp restore {dir}
 ",
             user = user.unwrap_or("unknown"),
-            dir = shell_quote(&source.to_string_lossy()),
+            stored = match remote {
+                Some(at) => format!("{at} (records in {records})"),
+                None => format!("{records} (inside this directory)"),
+            },
+            dir = shell_path(source),
         ),
         Some(h) => format!(
             "This directory was archived by stomp on {created} by {user}.
@@ -578,6 +582,16 @@ To restore without stomp, see {records}/README.txt.
     text
 }
 
+/// A path as people see it (`~/...`), quoted for a shell where needed with
+/// the `~` left outside the quotes so it still expands.
+fn shell_path(path: &Path) -> String {
+    let shown = crate::paths::display(path);
+    match shown.strip_prefix("~/") {
+        Some(rest) => format!("~/{}", shell_quote(rest)),
+        None => shell_quote(&shown),
+    }
+}
+
 fn shell_quote(s: &str) -> String {
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || "/._-~".contains(c))
@@ -603,6 +617,51 @@ mod tests {
             let back: PathField = serde_json::from_str(&json).unwrap();
             assert_eq!(back.get().unwrap(), p);
         }
+    }
+
+    #[test]
+    fn the_unfinished_note_is_tidy() {
+        let home = crate::paths::home_dir().unwrap();
+        let source = home.join("my runs");
+        let local = note_text(
+            "G-20261118-abcdef",
+            &source,
+            "2026-11-18T15:00:00Z",
+            Some("alex"),
+            None,
+            None,
+        );
+        assert!(
+            local.contains(
+                "Chunks:                 .stomp-archive/G-20261118-abcdef (inside this directory)"
+            ),
+            "{local}"
+        );
+        // `~` stays outside the quotes, so a shell still expands it.
+        assert!(
+            local.contains("stomp archive --resume ~/'my runs'"),
+            "{local}"
+        );
+        assert!(
+            local.contains("To put everything back: stomp restore ~/'my runs'"),
+            "{local}"
+        );
+        assert!(
+            local
+                .lines()
+                .all(|l| l.chars().count() <= 80 || l.starts_with("This directory")),
+            "{local}"
+        );
+
+        let remote = note_text(
+            "G-20261118-abcdef",
+            &source,
+            "2026-11-18T15:00:00Z",
+            Some("alex"),
+            None,
+            Some("nas:/archive/alex/G/G-20261118-abcdef"),
+        );
+        assert!(remote.contains("Chunks:                 nas:/archive/alex/G/G-20261118-abcdef (records in .stomp-archive/G-20261118-abcdef)"), "{remote}");
     }
 
     #[test]

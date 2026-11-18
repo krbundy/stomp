@@ -717,7 +717,11 @@ impl App {
             e.marks.iter().find(|m| matches!(m, Mark::Archived { .. }))
             && let Ok(s) = archive::load_settings(&archive::archive_path(&e.path, id))
         {
-            lines.push(format!("Archive   {id}, chunks at {}", s.destination));
+            lines.push(if s.is_remote() {
+                format!("Archive   {id}, chunks at {}", s.destination)
+            } else {
+                format!("Archive   {id}, chunks inside the directory")
+            });
         }
         match self.history(&e.path) {
             Ok(h) => lines.extend(h),

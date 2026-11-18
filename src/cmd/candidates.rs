@@ -112,7 +112,7 @@ fn frees(p: &Proposal) -> Option<u64> {
 /// Files left on the HPC after archiving: the chunks (for a local archive)
 /// plus the archive's records and note. Excluded directories inside aren't counted.
 fn files_after(cfg: &Config, p: &Proposal) -> u64 {
-    let records = 6;
+    let records = crate::archive::RECORD_FILES;
     if p.destination == LOCAL_DESTINATION {
         p.bytes.div_ceil(cfg.archive.chunk_size.max(1)).max(1) + records
     } else {

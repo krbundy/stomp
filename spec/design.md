@@ -624,8 +624,9 @@ Tests stop the run after every journaled step in turn, resume it, restore, and c
 
 #### Other commands
 
-- `stomp archives list` lists archives from the catalog.
-- `stomp archives show <ID|DIR>` summarizes one archive.
+- `stomp archives list` lists archives from the catalog, with a WHERE column: `directory`, a destination's name, or `—` once nothing remains. An unfinished archive shows its planned size and start time (the catalog hears of it once the plan is journaled).
+- `stomp archives show <ID|DIR>` summarizes one archive, starting with where its records and its chunks are.
+- The confirmation prompt, the estimate's file count and the note all reflect the destination: a remote archive leaves the six record files, and the note names where the chunks went on a `Chunks:` line.
 - `stomp archives verify <ID|DIR> [--deep]` checks the checksums; `--deep` also decompresses every chunk and checks every file.
 
 ## 13. Remote destinations

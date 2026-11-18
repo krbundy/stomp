@@ -215,13 +215,14 @@ impl Run<'_> {
             }
             plan::save(&self.dir, &plan)?;
             self.write_note(None)?;
-            self.send_record("in-progress", None)?;
             let summary = &plan.summary;
             self.step(Event::Planned {
                 chunks: summary.chunks,
                 files: summary.files,
                 bytes: summary.bytes,
             })?;
+            // After the plan is journaled, so the catalog learns its totals and start time.
+            self.send_record("in-progress", None)?;
         }
         let (chunks, _, _) = self.state.planned.expect("planned");
         for k in 1..=chunks {

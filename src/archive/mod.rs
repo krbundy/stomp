@@ -38,6 +38,9 @@ use crate::paths;
 use crate::scan::rules::Rules;
 
 pub const ARCHIVE_DIR: &str = ".stomp-archive";
+/// Files an archived directory holds besides any chunks: the note, and the
+/// manifest, SHA256SUMS, README, settings and journal.
+pub const RECORD_FILES: u64 = 6;
 pub const NOTE_FILE: &str = "STOMP_ARCHIVED.txt";
 
 /// What an archive run needs to know. Saved with the archive so a resumed

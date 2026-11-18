@@ -97,7 +97,11 @@ pub fn archive(
 
     let running_here = args.task.is_some() || args.here || in_job();
     if args.task.is_none() && !args.yes {
-        print_intent(&settings, existing.is_some());
+        let location = open_remote(cfg, &settings.destination)
+            .ok()
+            .flatten()
+            .map(|d| d.location(&settings.remote_prefix()));
+        print_intent(&settings, existing.is_some(), location.as_deref());
         if !confirm(if existing.is_some() {
             "Continue archiving?"
         } else {
@@ -177,7 +181,7 @@ pub fn archive_here(cfg: &Config, data_dir: &Path, settings: &Settings) -> Resul
     run_archive(cfg, data_dir, settings, None)
 }
 
-fn print_intent(s: &Settings, resuming: bool) {
+fn print_intent(s: &Settings, resuming: bool, location: Option<&str>) {
     let shown = paths::display(&s.source);
     let grant = s
         .grant
@@ -199,18 +203,28 @@ fn print_intent(s: &Settings, resuming: bool) {
         );
     }
     println!(
-        "  packed into chunks of up to {} with zstd level {}, kept in",
+        "  packed into chunks of up to {} with zstd level {}, {}",
         format_bytes(s.chunk_size),
-        s.level
+        s.level,
+        if s.is_remote() { "sent to" } else { "kept in" }
     );
-    println!(
-        "  {}",
-        paths::display(&archive::archive_path(&s.source, &s.id))
-    );
-    println!("The originals are removed one chunk at a time, after that chunk has been");
-    println!("read back and checked. Software environments, caches and files owned by");
-    println!("others stay in place. `--dry-run` shows the full plan; `--estimate` adds the");
-    println!("expected compressed size.");
+    let records = paths::display(&archive::archive_path(&s.source, &s.id));
+    if s.is_remote() {
+        println!("  {}", location.unwrap_or(&s.destination));
+        println!("  (the archive's records stay in {records})");
+    } else {
+        println!("  {records}");
+    }
+    if s.is_remote() {
+        println!(
+            "Each chunk is verified at {} before the originals in it are removed.",
+            s.destination
+        );
+    } else {
+        println!("Each chunk is read back and checked before the originals in it are removed.");
+    }
+    println!("Software environments, caches and files owned by others stay in place.");
+    println!("`--dry-run` shows the full plan; `--estimate` adds the expected size.");
 }
 
 /// Refuses to start without room under the quota for the chunk being written (§12.4).
@@ -284,7 +298,14 @@ fn plan_only(
         s.chunk_size,
     )?;
     let estimate = if estimate {
-        Some(archive::estimate(&s.source, &plan, s.level, s.threads)?)
+        Some(
+            archive::estimate(&s.source, &plan, s.level, s.threads).map(|mut e| {
+                if s.is_remote() {
+                    e.files_after = archive::RECORD_FILES; // the chunks leave the directory
+                }
+                e
+            })?,
+        )
     } else {
         None
     };
@@ -561,9 +582,16 @@ pub fn list(data_dir: &Path, format: Format) -> Result<()> {
             ("COMPRESSED", Align::Right),
             ("FILES", Align::Right),
             ("CREATED", Align::Left),
+            ("WHERE", Align::Left),
             ("DIRECTORY", Align::Left),
         ]);
         for a in &archives {
+            // Where the chunks are: in the directory, at a destination, or gone.
+            let at = match a.state.as_str() {
+                "restored" | "abandoned" => "—".to_string(),
+                _ if a.destination == LOCAL_DESTINATION => "directory".to_string(),
+                _ => a.destination.clone(),
+            };
             t.row(vec![
                 a.id.clone(),
                 a.state.clone(),
@@ -575,6 +603,7 @@ pub fn list(data_dir: &Path, format: Format) -> Result<()> {
                 },
                 format_count(a.files),
                 a.created_at.as_deref().map(short_local).unwrap_or_default(),
+                at,
                 paths::display(Path::new(&a.source)),
             ]);
         }
@@ -710,12 +739,30 @@ pub fn show(cfg: &Config, data_dir: &Path, what: &str) -> Result<()> {
     let (dir, source) = locate(data_dir, what)?;
     let _fetched = fetch_manifest(cfg, &dir, data_dir)?;
     let manifest_path = dir.join(manifest::MANIFEST);
-    println!(
-        "Archive    {}",
-        dir.file_name().unwrap_or_default().to_string_lossy()
-    );
+    let id = dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let kept = archive::is_kept_records(&dir, data_dir);
+    let settings = archive::load_settings(&dir).ok();
+    let chunks_at = match &settings {
+        Some(s) if s.is_remote() => open_catalog(data_dir)?
+            .archive(&id)?
+            .map(|a| a.location)
+            .filter(|l| !l.starts_with('/'))
+            .unwrap_or_else(|| s.destination.clone()),
+        _ => "inside the directory, with the records".to_string(),
+    };
+    println!("Archive    {id}");
     println!("Directory  {}", paths::display(&source));
-    println!("Stored in  {}", paths::display(&dir));
+    println!("Records    {}", paths::display(&dir));
+    println!("Chunks     {chunks_at}");
+    if kept {
+        println!(
+            "State      the files were restored; this copy is kept (`stomp archives delete {id}` deletes it)"
+        );
+    }
     if !manifest_path.exists() {
         let state = archive::journal::Journal::read(&dir.join("journal.jsonl"))?;
         let (chunks, files, bytes) = state.planned.unwrap_or_default();

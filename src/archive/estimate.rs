@@ -110,6 +110,7 @@ pub fn estimate(source: &Path, plan: &Plan, level: i32, threads: u32) -> Result<
         threads,
         predicted_seconds,
         files_before: plan.summary.files + plan.summary.symlinks + plan.summary.hardlinks,
-        files_after: u64::from(plan.summary.chunks) + 6,
+        // Chunks stay in the directory for a local archive; plan_only corrects a remote one.
+        files_after: u64::from(plan.summary.chunks) + super::RECORD_FILES,
     })
 }
