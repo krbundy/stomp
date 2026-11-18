@@ -27,6 +27,9 @@ const WINDOW: i64 = 30 * DAY;
 const OVERLAP: i64 = 3 * DAY;
 const DEFAULT_HISTORY: i64 = 90 * DAY;
 const SYNC_KEY: &str = "sacct_synced_until";
+/// How far back imports reach, so moving `compute.history_start` earlier
+/// later on still fills in the older jobs.
+const FROM_KEY: &str = "sacct_synced_from";
 
 /// Report label for compute that couldn't be attributed.
 pub const UNASSIGNED: &str = "(unassigned)";
@@ -169,36 +172,58 @@ pub fn sync(catalog: &mut Catalog, cfg: &Config, now: i64) -> Result<SyncSummary
         bail!("sacct was not found, so compute usage can't be imported here");
     }
     let tz = TimeZone::system();
-    let mut start = match catalog
-        .kv_get(SYNC_KEY)?
-        .and_then(|v| v.parse::<i64>().ok())
-    {
-        Some(last) => last - OVERLAP,
-        None => cfg
-            .compute
-            .history_start
-            .and_then(|d| d.to_zoned_datetime(tz.clone()).ok())
-            .map_or(now - DEFAULT_HISTORY, |z| z.timestamp().as_second()),
+    let wanted_from = cfg
+        .compute
+        .history_start
+        .and_then(|d| d.to_zoned_datetime(tz.clone()).ok())
+        .map(|z| z.timestamp().as_second());
+    let parse = |v: Option<String>| v.and_then(|v| v.parse::<i64>().ok());
+    // Ranges to import, oldest first.
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    let covered_from = match parse(catalog.kv_get(SYNC_KEY)?) {
+        Some(last) => {
+            // Catalogs from before FROM_KEY existed: the oldest job imported is a fair guess.
+            let covered = match parse(catalog.kv_get(FROM_KEY)?) {
+                Some(from) => from,
+                None => catalog.oldest_job_start()?.unwrap_or(last),
+            };
+            if let Some(want) = wanted_from
+                && want < covered
+            {
+                ranges.push((want, covered));
+            }
+            let mut start = last - OVERLAP;
+            if let Some(oldest) = catalog.oldest_unfinished_start()? {
+                start = start.min(oldest);
+            }
+            ranges.push((start, now));
+            covered.min(wanted_from.unwrap_or(covered))
+        }
+        None => {
+            let start = wanted_from.unwrap_or(now - DEFAULT_HISTORY);
+            ranges.push((start, now));
+            start
+        }
     };
-    if let Some(oldest) = catalog.oldest_unfinished_start()? {
-        start = start.min(oldest);
-    }
     let user = sys::user_name();
     let mut summary = SyncSummary {
         jobs: 0,
-        from: start,
+        from: ranges[0].0,
         to: now,
         warnings: Vec::new(),
     };
-    let mut from = start;
-    while from < now {
-        let to = (from + WINDOW).min(now);
-        let output = run_sacct(user.as_deref(), from, to, &tz)?;
-        let (jobs, warnings) = parse_sacct(&output, &tz);
-        summary.warnings.extend(warnings);
-        summary.jobs += catalog.upsert_jobs(&jobs, now)?;
-        from = to;
+    for (start, end) in ranges {
+        let mut from = start;
+        while from < end {
+            let to = (from + WINDOW).min(end);
+            let output = run_sacct(user.as_deref(), from, to, &tz)?;
+            let (jobs, warnings) = parse_sacct(&output, &tz);
+            summary.warnings.extend(warnings);
+            summary.jobs += catalog.upsert_jobs(&jobs, now)?;
+            from = to;
+        }
     }
+    catalog.kv_set(FROM_KEY, &covered_from.to_string())?;
     catalog.kv_set(SYNC_KEY, &now.to_string())?;
     Ok(summary)
 }

@@ -6,6 +6,20 @@ use anyhow::{Context, Result, bail};
 
 const IEC_UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
 
+/// For `serialize_with`: hours, costs and the like, rounded to two decimals,
+/// so CSV and JSON don't show float noise such as `92.17999999999999`.
+pub fn round2<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64((v * 100.0).round() / 100.0)
+}
+
+/// [`round2`] for optional values.
+pub fn round2_opt<S: serde::Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(v) => round2(v, s),
+        None => s.serialize_none(),
+    }
+}
+
 /// Formats a byte count with binary units, e.g. `12.4 TiB`.
 pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {

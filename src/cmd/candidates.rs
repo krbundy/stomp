@@ -244,7 +244,23 @@ pub fn list(cfg: &Config, data_dir: &Path, args: &ListArgs) -> Result<()> {
         }
         if rows.is_empty() {
             if !cfg.policies.is_empty() {
-                println!("No directories match your policies.");
+                // Earlier proposals that were applied or dismissed aren't
+                // proposed again, so "nothing matches" would be wrong.
+                let (mut applied, mut dismissed) = (0, 0);
+                for p in catalog.proposals(true)? {
+                    match p.state.as_str() {
+                        "applied" => applied += 1,
+                        "dismissed" => dismissed += 1,
+                        _ => {}
+                    }
+                }
+                if applied + dismissed == 0 {
+                    println!("No directories match your policies.");
+                } else {
+                    println!(
+                        "No open proposals ({applied} applied, {dismissed} dismissed); `stomp candidates --all` lists them."
+                    );
+                }
             }
             return Ok(());
         }

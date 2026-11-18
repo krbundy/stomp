@@ -19,6 +19,30 @@ pub const TOTAL: &str = "TOTAL";
 
 /// Seconds in an average month, for TB-months.
 const MONTH_SECONDS: f64 = 30.436_875 * 86_400.0;
+/// Measurements further apart than this (twice the daily run's interval)
+/// make a grant's TB-months an estimate (§8.2).
+const GAP_SECONDS: i64 = 2 * 86_400;
+
+/// Storage integrated over time for one grant (or unassigned, or the total).
+#[derive(Debug, Serialize)]
+struct TbMonths {
+    grant: String,
+    /// Decimal terabytes (10¹² bytes) held for an average month.
+    #[serde(serialize_with = "crate::units::round2")]
+    tb_months: f64,
+    #[serde(serialize_with = "crate::units::round2_opt")]
+    estimated_cost: Option<f64>,
+    /// Measurements were more than two days apart somewhere in the period,
+    /// so the storage in between is interpolated.
+    estimated: bool,
+    longest_gap_days: f64,
+}
+
+#[derive(Serialize)]
+struct HistoryJson<'a> {
+    measurements: &'a [Point],
+    tb_months: &'a [TbMonths],
+}
 
 #[derive(Debug, Serialize)]
 struct Point {
@@ -64,6 +88,7 @@ pub fn history(
     from: Option<&str>,
     to: Option<&str>,
     grant: Option<&str>,
+    only_tb_months: bool,
     format: Format,
 ) -> Result<()> {
     let start = from.map(|d| day_start(d, false)).transpose()?;
@@ -75,36 +100,91 @@ pub fn history(
         eprintln!("No recorded usage matches. Each run of `stomp usage` records a measurement.");
         return Ok(());
     }
+    let rate = cfg.rates.per_tb_month;
+    let months: Vec<TbMonths> = tb_months(&points)
+        .into_iter()
+        .map(|(grant, value, gap)| TbMonths {
+            grant,
+            tb_months: value,
+            estimated_cost: rate.map(|r| value * r),
+            estimated: gap > GAP_SECONDS,
+            longest_gap_days: (gap as f64 / 86_400.0 * 10.0).round() / 10.0,
+        })
+        .collect();
     match format {
-        Format::Json => println!("{}", serde_json::to_string_pretty(&points)?),
+        Format::Json if only_tb_months => println!("{}", serde_json::to_string_pretty(&months)?),
+        Format::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&HistoryJson {
+                measurements: &points,
+                tb_months: &months,
+            })?
+        ),
+        Format::Csv if only_tb_months => print!("{}", csv_from_rows(&months)?),
         Format::Csv => print!("{}", csv_from_rows(&points)?),
         Format::Table | Format::Md => {
             let markdown = format == Format::Md;
             let mut doc = Document::default();
-            doc.table(pivot(&points));
-            let months = tb_months(&points);
-            if !months.is_empty() {
+            if !only_tb_months {
+                doc.table(pivot(&points));
+            }
+            if months.is_empty() {
+                if only_tb_months {
+                    doc.text("TB-months need at least two measurements in the period.");
+                }
+            } else {
                 doc.heading("TB-months over this period");
-                let rate = cfg.rates.per_tb_month;
                 let mut columns = vec![("GRANT", Align::Left), ("TB-MONTHS", Align::Right)];
                 if rate.is_some() {
                     columns.push(("ESTIMATED COST", Align::Right));
                 }
                 let mut table = Table::new(&columns);
-                for (grant, value) in months {
-                    let mut cells = vec![grant, format!("{value:.2}")];
-                    if let Some(rate) = rate {
-                        cells.push(format!("{:.2}", value * rate));
+                for m in &months {
+                    let mut cells = vec![
+                        m.grant.clone(),
+                        format!("{:.2}{}", m.tb_months, if m.estimated { "*" } else { "" }),
+                    ];
+                    if let Some(cost) = m.estimated_cost {
+                        cells.push(format!("{cost:.2}"));
                     }
                     table.row(cells);
                 }
                 doc.table(table);
-                doc.text("Storage integrated over time between measurements; run `stomp usage` regularly (or schedule it) for accurate numbers.");
+                let mut note = "Storage held over time, in decimal terabytes (10¹² bytes) for an average month, \
+                     integrated between measurements."
+                    .to_string();
+                if months.iter().any(|m| m.estimated) {
+                    let gap = months
+                        .iter()
+                        .map(|m| m.longest_gap_days)
+                        .fold(0.0, f64::max);
+                    note += &format!(
+                        " * Estimated: measurements are up to {gap:.0} days apart, so the storage in between is interpolated. \
+                         `stomp schedule enable` records one a day."
+                    );
+                }
+                doc.text(&note);
             }
             print!("{}", doc.render(markdown));
         }
     }
     Ok(())
+}
+
+/// One grant's TB-months between `start` and `end`, and the longest gap
+/// between measurements in seconds; `None` without two measurements.
+pub(crate) fn grant_tb_months(
+    cfg: &Config,
+    catalog: &Catalog,
+    id: &str,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> Result<Option<(f64, i64)>> {
+    let points = points(cfg, catalog, start, end, Some(id))?;
+    Ok(tb_months(&points)
+        .into_iter()
+        .find(|(grant, _, _)| grant == id)
+        .map(|(_, value, gap)| (value, gap)))
 }
 
 fn points(
@@ -138,8 +218,9 @@ fn points(
     Ok(points)
 }
 
-/// Storage integrated over time per label (trapezoid rule), in TB-months.
-fn tb_months(points: &[Point]) -> Vec<(String, f64)> {
+/// Storage integrated over time per label (trapezoid rule), in TB-months,
+/// with the longest gap between measurements in seconds.
+fn tb_months(points: &[Point]) -> Vec<(String, f64, i64)> {
     let mut series: BTreeMap<&str, Vec<(i64, u64)>> = BTreeMap::new();
     for p in points {
         series
@@ -147,7 +228,7 @@ fn tb_months(points: &[Point]) -> Vec<(String, f64)> {
             .or_default()
             .push((p.measured_at.as_second(), p.bytes));
     }
-    let mut out: Vec<(String, f64)> = series
+    let mut out: Vec<(String, f64, i64)> = series
         .into_iter()
         .filter(|(_, s)| s.len() >= 2)
         .map(|(grant, s)| {
@@ -155,11 +236,12 @@ fn tb_months(points: &[Point]) -> Vec<(String, f64)> {
                 .windows(2)
                 .map(|w| (w[0].1 as f64 + w[1].1 as f64) / 2.0 * (w[1].0 - w[0].0) as f64)
                 .sum();
-            (grant.to_string(), byte_seconds / 1e12 / MONTH_SECONDS)
+            let gap = s.windows(2).map(|w| w[1].0 - w[0].0).max().unwrap_or(0);
+            (grant.to_string(), byte_seconds / 1e12 / MONTH_SECONDS, gap)
         })
         .collect();
     // Grants first, then unassigned and the total, as in the table above.
-    out.sort_by_key(|(label, _)| match label.as_str() {
+    out.sort_by_key(|(label, _, _)| match label.as_str() {
         UNASSIGNED => 1,
         TOTAL => 2,
         _ => 0,
@@ -220,6 +302,7 @@ mod tests {
         let result = tb_months(&[point(0, 2_000_000_000_000), point(month, 2_000_000_000_000)]);
         assert_eq!(result.len(), 1);
         assert!((result[0].1 - 2.0).abs() < 1e-6, "{result:?}");
+        assert_eq!(result[0].2, month, "the gap between the two measurements");
         // Growing linearly from 0 to 2 TB averages 1 TB.
         let result = tb_months(&[point(0, 0), point(month, 2_000_000_000_000)]);
         assert!((result[0].1 - 1.0).abs() < 1e-6);

@@ -365,3 +365,19 @@ fn estimates_compression_from_samples() {
     assert!(ratio > 0.95, "random data compressed to {ratio}");
     assert!(estimate_ratio(&f.p("loose"), &rows, 3).is_none());
 }
+
+#[test]
+fn estimates_find_files_in_folded_subdirectories() {
+    // Every file is in a small subdirectory, which the scan folds into its
+    // parent: the parent's row has the bytes, the subdirectories have none.
+    let f = Fixture::new();
+    let runs = f.p("active/runs");
+    for i in 0..5 {
+        let dir = runs.join(format!("run_{i:02}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("out.csv"), "site,value\n".repeat(5_000)).unwrap();
+    }
+    let rows = vec![f.row("active/runs", 275_000, 5, 1)];
+    let ratio = estimate_ratio(&runs, &rows, 3).expect("samples found in run_*/");
+    assert!(ratio < 0.05, "text compressed to {ratio}");
+}

@@ -364,6 +364,9 @@ pub fn estimate_ratio(path: &Path, rows: &[DirRow], level: i32) -> Option<f64> {
         })
         .collect();
     let weights: Vec<u64> = dirs.iter().map(|r| r.direct_bytes).collect();
+    // A row's direct totals include small subdirectories the scan folded
+    // into it, so its files are looked for in those too.
+    let has_row: HashSet<&Path> = rows.iter().map(|r| r.path.as_path()).collect();
     let mut rng = Rng::new(path.as_os_str().as_encoded_bytes());
     let mut listings: HashMap<usize, Vec<(PathBuf, u64)>> = HashMap::new();
     let mut buf = vec![0u8; SAMPLE_BYTES];
@@ -371,17 +374,9 @@ pub fn estimate_ratio(path: &Path, rows: &[DirRow], level: i32) -> Option<f64> {
     for _ in 0..SAMPLES {
         let Some(d) = rng.pick(&weights) else { break };
         let files = listings.entry(d).or_insert_with(|| {
-            std::fs::read_dir(&dirs[d].path)
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .filter_map(|e| {
-                            let md = e.metadata().ok()?;
-                            (md.is_file() && md.len() > 0).then(|| (e.path(), md.len()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            let mut found = Vec::new();
+            files_under(&dirs[d].path, &has_row, &mut found);
+            found
         });
         let sizes: Vec<u64> = files.iter().map(|f| f.1).collect();
         let Some(f) = rng.pick(&sizes) else { continue };
@@ -405,6 +400,34 @@ pub fn estimate_ratio(path: &Path, rows: &[DirRow], level: i32) -> Option<f64> {
         compressed += out.len() as u64;
     }
     (read > 0).then(|| compressed as f64 / read as f64)
+}
+
+/// Most files listed per directory when looking for samples.
+const LISTING_LIMIT: usize = 2000;
+
+/// Non-empty files in `dir` and in subdirectories without a row of their own
+/// (folded into it by the scan), without following symlinks.
+fn files_under(dir: &Path, has_row: &HashSet<&Path>, out: &mut Vec<(PathBuf, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if out.len() >= LISTING_LIMIT {
+            return;
+        }
+        let Ok(kind) = e.file_type() else { continue };
+        let path = e.path();
+        if kind.is_file() {
+            if let Ok(md) = e.metadata()
+                && md.len() > 0
+            {
+                out.push((path, md.len()));
+            }
+        } else if kind.is_dir() && !has_row.contains(path.as_path()) && e.file_name() != ARCHIVE_DIR
+        {
+            files_under(&path, has_row, out);
+        }
+    }
 }
 
 #[cfg(test)]

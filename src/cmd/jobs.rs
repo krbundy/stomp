@@ -77,17 +77,29 @@ struct JobRow {
     state: String,
     start: String,
     end: String,
+    #[serde(serialize_with = "crate::units::round2")]
     cpu_hours: f64,
+    #[serde(serialize_with = "crate::units::round2")]
     gpu_hours: f64,
     grant: String,
     attributed_by: compute::By,
+    /// The `--note` given to `stomp jobs log`, if any.
+    note: Option<String>,
 }
 
 /// `stomp jobs list`: recent jobs with their grant.
 pub fn list(cfg: &Config, data_dir: &Path, args: &ListArgs) -> Result<()> {
     let since = parse_since(args.since.as_deref().unwrap_or("30d"))?;
     let (catalog, _) = synced_catalog(cfg, data_dir, !args.no_sync)?;
-    let attributor = Attributor::new(cfg, catalog.tags()?);
+    let tags = catalog.tags()?;
+    // Notes are stored with tags: on the job itself, or on its array.
+    let note_of = |job: &compute::Job| -> Option<String> {
+        tags.get(&job.job_id)
+            .or_else(|| tags.get(&job.parent_id))
+            .and_then(|t| t.note.clone())
+            .filter(|n| !n.is_empty())
+    };
+    let attributor = Attributor::new(cfg, tags.clone());
     let rows: Vec<JobRow> = catalog
         .jobs_in_range(Some(since), None)?
         .into_iter()
@@ -99,6 +111,7 @@ pub fn list(cfg: &Config, data_dir: &Path, args: &ListArgs) -> Result<()> {
                 (None, false) => true,
             };
             keep.then(|| JobRow {
+                note: note_of(&job),
                 cpu_hours: job.cpu_hours(),
                 gpu_hours: job.gpu_hours(),
                 job_id: job.job_id,
@@ -115,8 +128,9 @@ pub fn list(cfg: &Config, data_dir: &Path, args: &ListArgs) -> Result<()> {
         println!("No jobs match.");
         return Ok(());
     }
+    let any_notes = rows.iter().any(|r| r.note.is_some());
     emit(args.format, &rows, || {
-        let mut t = Table::new(&[
+        let mut columns = vec![
             ("JOB", Align::Left),
             ("NAME", Align::Left),
             ("STATE", Align::Left),
@@ -125,14 +139,18 @@ pub fn list(cfg: &Config, data_dir: &Path, args: &ListArgs) -> Result<()> {
             ("GPU-H", Align::Right),
             ("GRANT", Align::Left),
             ("BY", Align::Left),
-        ]);
+        ];
+        if any_notes {
+            columns.push(("NOTE", Align::Left));
+        }
+        let mut t = Table::new(&columns);
         for r in &rows {
             let ended = if r.end.is_empty() {
                 "running".to_string()
             } else {
                 short_local(&r.end)
             };
-            t.row(vec![
+            let mut cells = vec![
                 r.job_id.clone(),
                 r.name.chars().take(24).collect(),
                 r.state.clone(),
@@ -141,7 +159,11 @@ pub fn list(cfg: &Config, data_dir: &Path, args: &ListArgs) -> Result<()> {
                 format_hours(r.gpu_hours),
                 r.grant.clone(),
                 r.attributed_by.label().to_string(),
-            ]);
+            ];
+            if any_notes {
+                cells.push(r.note.as_deref().unwrap_or("").chars().take(40).collect());
+            }
+            t.row(cells);
         }
         t
     })
@@ -193,41 +215,53 @@ pub fn log(
     note: Option<&str>,
     strict: bool,
 ) -> ExitCode {
-    let mut warnings = Vec::new();
+    // With --strict, problems are errors: said as such, and an unknown grant
+    // isn't recorded. Without it, the job is always logged if it can be.
+    let label = if strict { "error" } else { "warning" };
+    let mut problems = Vec::new();
     let known_grant = match Config::load(config_path) {
         Ok(cfg) => {
             let known = cfg.grant(grant).is_some();
             if !known {
-                warnings.push(format!(
-                    "grant {grant:?} is not in {}; the job is logged anyway and will show as an unknown grant until you fix it",
-                    paths::display(config_path)
-                ));
+                problems.push(if strict {
+                    format!(
+                        "grant {grant:?} is not in {}; the job was not logged",
+                        paths::display(config_path)
+                    )
+                } else {
+                    format!(
+                        "grant {grant:?} is not in {}; the job is logged anyway and will show as an unknown grant until you fix it",
+                        paths::display(config_path)
+                    )
+                });
             }
             Some(known)
         }
         Err(e) => {
-            warnings.push(format!(
+            problems.push(format!(
                 "could not read the config, so the grant ID wasn't checked: {e}"
             ));
             None
         }
     };
 
-    match jobs::log(data_dir, grant, explicit, note, known_grant, |k| {
-        std::env::var(k).ok()
-    }) {
-        Ok(messages) => {
-            for m in messages {
-                eprintln!("stomp: {m}");
+    if !(strict && known_grant == Some(false)) {
+        match jobs::log(data_dir, grant, explicit, note, known_grant, |k| {
+            std::env::var(k).ok()
+        }) {
+            Ok(messages) => {
+                for m in messages {
+                    eprintln!("stomp: {m}");
+                }
             }
+            Err(e) => problems.push(format!("job not logged: {e:#}")),
         }
-        Err(e) => warnings.push(format!("job not logged: {e:#}")),
     }
 
-    for w in &warnings {
-        eprintln!("stomp: warning: {w}");
+    for p in &problems {
+        eprintln!("stomp: {label}: {p}");
     }
-    if strict && !warnings.is_empty() {
+    if strict && !problems.is_empty() {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS

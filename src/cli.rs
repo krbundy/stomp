@@ -416,6 +416,9 @@ enum ReportCommand {
         /// Only show this grant
         #[arg(long)]
         grant: Option<String>,
+        /// Only the TB-months per grant (with costs, if rates are set), in any format
+        #[arg(long)]
+        tb_months: bool,
         #[arg(long, value_enum, default_value_t = Format::Table)]
         format: Format,
     },
@@ -440,6 +443,12 @@ enum ReportCommand {
     Grant {
         /// Grant ID
         id: String,
+        /// First day of the period for storage history and compute (YYYY-MM-DD) [default: the grant's start, or a year ago]
+        #[arg(long, value_name = "DATE")]
+        from: Option<String>,
+        /// Last day of the period (YYYY-MM-DD) [default: today]
+        #[arg(long, value_name = "DATE")]
+        to: Option<String>,
         #[arg(long, value_enum, default_value_t = Format::Table)]
         format: Format,
     },
@@ -645,6 +654,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             from,
             to,
             grant,
+            tb_months,
             format: f,
         }) => {
             let cfg = load_config(&config_path)?;
@@ -654,6 +664,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 from.as_deref(),
                 to.as_deref(),
                 grant.as_deref(),
+                tb_months,
                 format(f),
             )?;
         }
@@ -751,8 +762,20 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             };
             cmd::report::compute(&load_config(&config_path)?, &data_dir, &args)?;
         }
-        Command::Report(ReportCommand::Grant { id, format: f }) => {
-            cmd::report::grant(&load_config(&config_path)?, &data_dir, &id, format(f))?;
+        Command::Report(ReportCommand::Grant {
+            id,
+            from,
+            to,
+            format: f,
+        }) => {
+            cmd::report::grant(
+                &load_config(&config_path)?,
+                &data_dir,
+                &id,
+                from.as_deref(),
+                to.as_deref(),
+                format(f),
+            )?;
         }
         Command::Report(ReportCommand::Stale {
             older_than,

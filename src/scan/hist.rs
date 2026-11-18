@@ -110,12 +110,17 @@ impl Agg {
     }
 
     /// Totals only, for a directory measured without walking it.
+    /// The totals of a directory that's measured but not walked (an
+    /// environment or cache). Its files' modification times aren't read, so
+    /// the newest change time stands in for the newest one: never earlier,
+    /// so the directory can't look staler than it is.
     pub fn from_usage(u: &Usage) -> Agg {
         Agg {
             bytes: u.bytes,
             files: u.files,
             unreadable: u.unreadable,
             newest_change: u.newest_change,
+            newest_mtime: u.newest_change,
             ..Agg::default()
         }
     }

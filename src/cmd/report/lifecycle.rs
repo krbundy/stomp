@@ -29,6 +29,7 @@ struct Row {
     /// Stored size of archives held at remote destinations.
     archived_remote_bytes: u64,
     jobs_after_end: u64,
+    #[serde(serialize_with = "crate::units::round2")]
     cpu_hours_after_end: f64,
 }
 

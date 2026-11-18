@@ -221,6 +221,15 @@ impl Catalog {
         )?)
     }
 
+    /// When the oldest imported job started (or was submitted).
+    pub fn oldest_job_start(&self) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT min(coalesce(start_time, submit_time)) FROM compute_jobs",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn job_count(&self) -> Result<i64> {
         Ok(self
             .conn

@@ -30,9 +30,13 @@ pub struct Row {
     /// Jobs that ended in any state but COMPLETED (failed, cancelled, timed out…).
     pub not_completed: u64,
     pub running: u64,
+    #[serde(serialize_with = "crate::units::round2")]
     pub cpu_hours: f64,
+    #[serde(serialize_with = "crate::units::round2")]
     pub gpu_hours: f64,
+    #[serde(serialize_with = "crate::units::round2_opt")]
     pub billing_hours: Option<f64>,
+    #[serde(serialize_with = "crate::units::round2_opt")]
     pub estimated_cost: Option<f64>,
     pub by_log: u64,
     pub by_task: u64,

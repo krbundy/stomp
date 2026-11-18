@@ -162,6 +162,10 @@ fn walks_folds_and_excludes() {
         env.agg.months.is_empty(),
         "excluded directories aren't walked"
     );
+    // ...but their newest change still counts as recent activity, so a parent
+    // holding a busy environment isn't reported as stale.
+    assert!(env.agg.newest_mtime.is_some());
+    assert_eq!(env.agg.newest_mtime, env.agg.newest_change);
     assert_eq!(
         r("proj/node_modules").unwrap().excluded,
         Some(ExcludeKind::User)

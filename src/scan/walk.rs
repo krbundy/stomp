@@ -342,6 +342,8 @@ impl Walker<'_> {
             unreadable: 1,
             ..Usage::default()
         });
+        // Counted like everything else, so the scan's totals match `stomp du`.
+        Progress::add(&self.progress.files, usage.files);
         Progress::add(&self.progress.bytes, usage.bytes);
         Walked {
             row: DirRow::new(path, None, Some(kind), 0, 0, Agg::from_usage(&usage)),

@@ -9,7 +9,7 @@ use jiff::Timestamp;
 use serde::Serialize;
 
 use super::totals_by_grant;
-use crate::cmd::{Format, jobs::synced_catalog, local_date, local_time};
+use crate::cmd::{Format, day_start, jobs::synced_catalog, local_date, local_time};
 use crate::compute::Attributor;
 use crate::config::Config;
 use crate::paths;
@@ -27,11 +27,27 @@ struct Report {
     pi: Option<String>,
     start: Option<String>,
     end: Option<String>,
+    /// The period storage history and compute cover: `--from`/`--to`, by
+    /// default the grant's start (or a year ago) to today.
+    period_from: String,
+    period_to: String,
     storage: Option<Storage>,
     storage_by_month: Vec<MonthStorage>,
+    /// Storage held over the period, in decimal TB for an average month.
+    #[serde(serialize_with = "crate::units::round2_opt")]
+    tb_months: Option<f64>,
+    /// Measurements more than two days apart make `tb_months` an estimate.
+    tb_months_estimated: bool,
+    #[serde(serialize_with = "crate::units::round2_opt")]
+    storage_cost: Option<f64>,
     scan: Option<ScanSection>,
+    /// Archives finished after the scan above, which its numbers don't reflect.
+    archived_since_scan: usize,
     archives: Vec<crate::catalog::CatalogArchive>,
     compute_by_month: Vec<MonthCompute>,
+    compute_total: MonthCompute,
+    #[serde(serialize_with = "crate::units::round2_opt")]
+    compute_cost: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -98,11 +114,20 @@ struct LargeFile {
 struct MonthCompute {
     month: String,
     jobs: u64,
+    #[serde(serialize_with = "crate::units::round2")]
     cpu_hours: f64,
+    #[serde(serialize_with = "crate::units::round2")]
     gpu_hours: f64,
 }
 
-pub fn grant(cfg: &Config, data_dir: &Path, id: &str, format: Format) -> Result<()> {
+pub fn grant(
+    cfg: &Config,
+    data_dir: &Path,
+    id: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    format: Format,
+) -> Result<()> {
     if format == Format::Csv {
         bail!("the grant report has several sections; use --format table, md or json");
     }
@@ -111,6 +136,23 @@ pub fn grant(cfg: &Config, data_dir: &Path, id: &str, format: Format) -> Result<
         .with_context(|| format!("no grant {id:?} in {}", paths::display(&cfg.source)))?;
     let (catalog, _) = synced_catalog(cfg, data_dir, true)?;
     let now = Timestamp::now().as_second();
+    // The period: the whole grant so far by default, so final numbers are complete.
+    let start = match from {
+        Some(d) => day_start(d, false)?,
+        None => match grant.start {
+            Some(d) => day_start(&d.to_string(), false)?,
+            None => now - YEAR,
+        },
+    };
+    let end = to.map(|d| day_start(d, true)).transpose()?;
+    if end.is_some_and(|e| e <= start) {
+        bail!("--to is before the period's start");
+    }
+    let period_from = local_date(start);
+    let period_to = match to {
+        Some(d) => d.to_string(),
+        None => local_date(now),
+    };
 
     // Storage now, from the newest measurement.
     let storage = match catalog.measurement_at_or_before(now)? {
@@ -141,9 +183,9 @@ pub fn grant(cfg: &Config, data_dir: &Path, id: &str, format: Format) -> Result<
         None => None,
     };
 
-    // The last measurement of each month over the past year.
+    // The last measurement of each month in the period.
     let mut by_measurement: BTreeMap<(i64, i64), Vec<_>> = BTreeMap::new();
-    for s in catalog.samples(Some(now - YEAR), None)? {
+    for s in catalog.samples(Some(start), end)? {
         by_measurement
             .entry((s.taken_at, s.measurement_id))
             .or_default()
@@ -235,10 +277,26 @@ pub fn grant(cfg: &Config, data_dir: &Path, id: &str, format: Format) -> Result<
         None => None,
     };
 
-    // Compute per month over the past year.
+    let tb = super::history::grant_tb_months(cfg, &catalog, id, Some(start), end)?;
+    let archived_since_scan = match &scan {
+        Some(s) => catalog
+            .archives()?
+            .iter()
+            .filter(|a| a.grant.as_deref() == Some(id))
+            .filter_map(|a| a.finished_at.as_deref()?.parse::<Timestamp>().ok())
+            .filter(|t| *t > s.scanned_at)
+            .count(),
+        None => 0,
+    };
+
+    // Compute per month in the period.
     let attributor = Attributor::new(cfg, catalog.tags()?);
     let mut compute: BTreeMap<String, MonthCompute> = BTreeMap::new();
-    for job in catalog.jobs_in_range(Some(now - YEAR), None)? {
+    let mut compute_total = MonthCompute {
+        month: "TOTAL".into(),
+        ..MonthCompute::default()
+    };
+    for job in catalog.jobs_in_range(Some(start), end)? {
         if attributor.attribute(&job).0 != id {
             continue;
         }
@@ -253,7 +311,15 @@ pub fn grant(cfg: &Config, data_dir: &Path, id: &str, format: Format) -> Result<
         entry.jobs += 1;
         entry.cpu_hours += job.cpu_hours();
         entry.gpu_hours += job.gpu_hours();
+        compute_total.jobs += 1;
+        compute_total.cpu_hours += job.cpu_hours();
+        compute_total.gpu_hours += job.gpu_hours();
     }
+    let rates = &cfg.rates;
+    let compute_cost = (rates.per_cpu_hour.is_some() || rates.per_gpu_hour.is_some()).then(|| {
+        compute_total.cpu_hours * rates.per_cpu_hour.unwrap_or(0.0)
+            + compute_total.gpu_hours * rates.per_gpu_hour.unwrap_or(0.0)
+    });
 
     let report = Report {
         id: grant.id.clone(),
@@ -261,18 +327,26 @@ pub fn grant(cfg: &Config, data_dir: &Path, id: &str, format: Format) -> Result<
         pi: grant.pi.clone(),
         start: grant.start.map(|d| d.to_string()),
         end: grant.end.map(|d| d.to_string()),
+        period_from,
+        period_to,
         storage,
         storage_by_month: monthly
             .into_iter()
             .map(|(month, bytes)| MonthStorage { month, bytes })
             .collect(),
+        tb_months: tb.map(|t| t.0),
+        tb_months_estimated: tb.is_some_and(|t| t.1 > 2 * 86_400),
+        storage_cost: tb.and_then(|t| rates.per_tb_month.map(|r| t.0 * r)),
         scan,
+        archived_since_scan,
         archives: catalog
             .archives()?
             .into_iter()
             .filter(|a| a.grant.as_deref() == Some(id))
             .collect(),
         compute_by_month: compute.into_values().collect(),
+        compute_total,
+        compute_cost,
     };
     match format {
         Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),
@@ -308,6 +382,10 @@ fn render(r: &Report) -> Document {
     if !facts.is_empty() {
         doc.text(facts.join(" · "));
     }
+    doc.text(format!(
+        "Storage history and compute cover {} to {}.",
+        r.period_from, r.period_to
+    ));
 
     doc.heading("Storage");
     match &r.storage {
@@ -345,6 +423,20 @@ fn render(r: &Report) -> Document {
         }
         doc.table(t);
     }
+    if let Some(tb) = r.tb_months {
+        doc.text(format!(
+            "Storage over the period: {tb:.2} TB-months{}{}.",
+            match r.storage_cost {
+                Some(cost) => format!(", about {cost:.2} at the configured rate"),
+                None => String::new(),
+            },
+            if r.tb_months_estimated {
+                " (estimated: measurements are more than two days apart in places)"
+            } else {
+                ""
+            }
+        ));
+    }
 
     match &r.scan {
         Some(scan) => {
@@ -354,6 +446,13 @@ fn render(r: &Report) -> Document {
                 "By last modification, from the scan of {}. Software environments and caches aren't included.",
                 local_time(scan.scanned_at)
             ));
+            if r.archived_since_scan > 0 {
+                doc.text(format!(
+                    "{} archive(s) finished since this scan, so the sections from it still include \
+                     their data; run `stomp scan` for current numbers.",
+                    r.archived_since_scan
+                ));
+            }
             let mut t = Table::new(&[
                 ("LAST MODIFIED", Align::Left),
                 ("SIZE", Align::Right),
@@ -478,7 +577,7 @@ fn render(r: &Report) -> Document {
 
     doc.heading("Compute by month");
     if r.compute_by_month.is_empty() {
-        doc.text("No jobs attributed to this grant in the past year.");
+        doc.text("No jobs attributed to this grant in this period.");
     } else {
         let mut t = Table::new(&[
             ("MONTH", Align::Left),
@@ -486,7 +585,13 @@ fn render(r: &Report) -> Document {
             ("CPU-HOURS", Align::Right),
             ("GPU-HOURS", Align::Right),
         ]);
-        for m in &r.compute_by_month {
+        for m in r.compute_by_month.iter().chain(
+            // A total row when there's more than one month to add up.
+            (r.compute_by_month.len() > 1).then_some(&r.compute_total),
+        ) {
+            if m.month == "TOTAL" {
+                t.rule();
+            }
             t.row(vec![
                 m.month.clone(),
                 m.jobs.to_string(),
@@ -495,6 +600,9 @@ fn render(r: &Report) -> Document {
             ]);
         }
         doc.table(t);
+        if let Some(cost) = r.compute_cost {
+            doc.text(format!("About {cost:.2} at the configured rates."));
+        }
     }
     doc
 }

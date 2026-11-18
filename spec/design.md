@@ -320,7 +320,7 @@ On a POSIX backend the same calculation uses totals from the most recent scan.
 ### 8.2 Samples and history
 
 - Every `stomp usage` run records a usage sample for each root and grant directory. The scheduled task (§14.4) also records one.
-- **TB-months:** usage is added up over time between samples. If a period has gaps longer than `2 × schedule interval`, its numbers are marked *estimated*.
+- **TB-months:** usage is added up over time between samples, in decimal terabytes (10¹² bytes) for an average month, which is how storage is usually billed; reports say so. If measurements are more than two days (`2 × schedule interval`) apart anywhere in the period, the numbers are marked *estimated*. `stomp report history` gives them in every format: JSON as `{measurements, tb_months}`, and `--tb-months` alone (CSV included) for spreadsheets.
 - If `rate_per_tb_month` is set, reports also show an estimated cost.
 - **Remapping a directory re-attributes its history.** Samples are stored per path and assigned to grants using the *current* config, so moving a directory to a different grant moves its whole history. The same applies to compute jobs attributed by working directory (§15.2). Mappings with effective dates are a possible later addition (§25).
 
@@ -891,7 +891,8 @@ srun ./model ...
 - **Job arrays:** the record is keyed by `SLURM_ARRAY_JOB_ID`, so the whole array is logged once. Later tasks in the array see that the record exists and do nothing.
 - **Fast and lock-free.** It creates one small file, `inbox/jobs/<job-id>.json`, by writing to a temporary name and renaming it. It doesn't open the catalog or take any locks, and it returns within milliseconds.
 - **Never breaks the job.**
-  - It always exits 0 and reports problems as warnings on stderr. `--strict` turns warnings into errors for users who want that.
+  - It always exits 0 and reports problems as warnings on stderr. `--strict` turns them into errors (said as `error:`, exit 1), and then an unknown grant isn't recorded.
+  - The note is shown in `stomp jobs list`, as a NOTE column when any job has one.
   - An unknown grant ID is still recorded, with a warning. Reports show it as *unknown grant "X"* so a typo is visible and can be fixed with `stomp jobs retag`.
   - If the config can't be read, the record is still written.
 
@@ -912,7 +913,7 @@ srun ./model ...
   - `JobID`, `JobName`, `State`, `Submit`, `Start`, `End`
   - `ElapsedRaw`, `CPUTimeRAW`, `AllocTRES`
   - `WorkDir`, `Partition`, `Account`
-- **Bounded queries.** Queries cover bounded time windows (one month at a time when filling in history), to keep load off the accounting database. The first sync goes back to `compute.history_start`.
+- **Bounded queries.** Queries cover bounded time windows (one month at a time when filling in history), to keep load off the accounting database. The first sync goes back to `compute.history_start` (or 90 days). stomp remembers how far back imports reach, so setting `history_start` earlier later on fills in the older jobs at the next sync.
 - **Records are copied into the catalog** (`compute_jobs`) because sites eventually purge old accounting records. Once copied, reports don't depend on `sacct` keeping them.
 - **Running jobs** are shown as in progress and recorded when they finish.
 
@@ -1050,8 +1051,8 @@ The one exception is `stomp jobs log`, which always exits 0 unless `--strict` is
 |--------|----------|
 | `usage` | Current per-grant storage, excluded directories and unassigned usage, quota, remote holdings by destination |
 | `compute` | Per-grant jobs, CPU hours, GPU hours and billing units for a period, with how each job was attributed (§15.4) |
-| `history` | Per-grant storage (TB-months) and compute over time; optional cost estimates |
-| `grant <id>` | One grant's storage and compute together: directories, usage over time, age profile, top extensions, largest files, archives by destination, CPU and GPU hours by month. Suitable for a progress report or data management plan. |
+| `history` | Per-grant storage over time, with TB-months; optional cost estimates. Compute over time is `report compute --by-month`. |
+| `grant <id>` | One grant's storage and compute together: directories, usage over time, TB-months, age profile, top extensions, largest files, archives by destination, CPU and GPU hours by month with a total and cost. History and compute cover `--from`/`--to`, by default the grant's start (or a year ago) to today, so final numbers cover the whole grant. Sections from a scan say when archives have finished since it. Suitable for a progress report or data management plan. |
 | `lifecycle` | Grants past their end date that still have data on the HPC or jobs logged to them; remote holdings by grant |
 | `stale [--older-than 180d] [--grant G] [--top N]` | The largest directories with no file modified within the period. Only the topmost stale directory of each subtree is listed, since everything inside it is stale too. A policy with `unchanged_for` turns such directories into proposals (§16). |
 | `reclaimable` | Caches and software environments with suggested commands, such as `apptainer cache clean`, `conda clean --all`, or `apptainer build` to turn a sandbox into one SIF file |
