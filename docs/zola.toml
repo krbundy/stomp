@@ -1,5 +1,5 @@
 # The URL the site will be built for
-base_url = "https://stomp.psae.us"
+base_url = "https://krbundy.github.io/stomp"
 title = "stomp"
 description = "Track storage and compute per research grant on HPC clusters, and archive what you're done with."
 default_language = "en"

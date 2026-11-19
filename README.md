@@ -1,13 +1,19 @@
 # stomp
 
+[![CI](https://github.com/krbundy/stomp/actions/workflows/ci.yml/badge.svg)](https://github.com/krbundy/stomp/actions/workflows/ci.yml)
+[![Docs](https://github.com/krbundy/stomp/actions/workflows/docs.yml/badge.svg)](https://krbundy.github.io/stomp/)
+
 A storage management utility for HPC users. stomp runs as you, with no root or
 admin help, and attributes your storage and Slurm jobs to the research grants
 that pay for them.
 
-The full design is in [`spec/design.md`](spec/design.md). The user
-documentation, with tutorials and a complete command and configuration
-reference, is a [Zola](https://www.getzola.org) site in [`docs/`](docs/), built
-for <https://stomp.psae.us>; preview it with `zola serve` in that directory. Milestones M1 through
+**Documentation:** <https://krbundy.github.io/stomp/>, with tutorials and a
+complete command and configuration reference. **Download:** the static Linux
+binary is on the [releases page](https://github.com/krbundy/stomp/releases).
+
+The full design is in [`spec/design.md`](spec/design.md). The documentation
+site is a [Zola](https://www.getzola.org) site in [`docs/`](docs/); preview it
+with `zola serve` in that directory. Milestones M1 through
 M5 and M7 are done (M6, cold storage, is deferred):
 
 | Command | What it does |
@@ -175,6 +181,21 @@ LEVELS="3 9 19" SAMPLE_GB=10 sbatch scripts/stomp-test.sbatch ~/carbon_mapping
 Results land in `stomp-test-<job>.out` (with a summary at the end) and
 `stomp-test-<job>.tsv`. The settings are described at the top of the script.
 
+## Installing
+
+Download the static binary from the latest release on a login node:
+
+```sh
+mkdir -p ~/bin && cd ~/bin
+base=https://github.com/krbundy/stomp/releases/latest/download
+curl -fsSLO $base/stomp-x86_64-linux
+curl -fsSLO $base/stomp-x86_64-linux.sha256
+sha256sum -c stomp-x86_64-linux.sha256 && mv stomp-x86_64-linux stomp && chmod +x stomp
+rm stomp-x86_64-linux.sha256
+```
+
+Or build it yourself, as below.
+
 ## Building
 
 ```sh
@@ -199,6 +220,33 @@ ssh <cluster> 'mkdir -p ~/bin'
 scp dist/stomp-0.1.0-x86_64-linux <cluster>:bin/stomp
 ssh <cluster> 'chmod +x ~/bin/stomp && ~/bin/stomp --version'
 ```
+
+## Continuous integration and releases
+
+GitHub Actions runs three workflows in [`.github/workflows`](.github/workflows):
+
+- **CI** checks formatting, runs clippy and the tests on every pull request
+  and push to `main`, and checks that stomp still builds with the minimum Rust
+  version in `Cargo.toml`.
+- **Docs** checks the documentation site's links on pull requests that touch
+  `docs/`, and publishes the site to GitHub Pages when they reach `main`.
+- **Release** builds the static binary with `scripts/build-static.sh --test`
+  when a version tag is pushed, and publishes it with its SHA-256 as a GitHub
+  release.
+
+To release, set the version in `Cargo.toml` and run `cargo check` so
+`Cargo.lock` picks it up (the builds use `--locked`). Commit both to `main`,
+then tag that commit and push the tag:
+
+```sh
+git tag -a v0.2.0 -m "stomp 0.2.0"
+git push origin v0.2.0
+```
+
+The tag has to match the version in `Cargo.toml`, or the release stops before
+building. A tag with a suffix, like `v0.2.0-rc.1`, makes a pre-release. To try
+the release build without publishing anything, run the Release workflow by
+hand from the Actions tab.
 
 ## Getting started
 

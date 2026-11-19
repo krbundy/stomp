@@ -1,6 +1,6 @@
 +++
 title = "Install stomp"
-description = "Copy one static binary to your cluster, or build it from source."
+description = "Download one static binary to your cluster, or build it from source."
 weight = 10
 +++
 
@@ -20,7 +20,30 @@ no libraries on the cluster: you put it in `~/bin` and run it.
 
 ## Get the binary
 
-### Build a static binary on your workstation
+### Download a release
+
+Each [release](https://github.com/krbundy/stomp/releases) has the static
+binary and its SHA-256. On a login node:
+
+```sh
+mkdir -p ~/bin && cd ~/bin
+base=https://github.com/krbundy/stomp/releases/latest/download
+curl -fsSLO $base/stomp-x86_64-linux
+curl -fsSLO $base/stomp-x86_64-linux.sha256
+sha256sum -c stomp-x86_64-linux.sha256 && mv stomp-x86_64-linux stomp && chmod +x stomp
+rm stomp-x86_64-linux.sha256
+```
+
+```text
+stomp-x86_64-linux: OK
+```
+
+The checksum confirms the file arrived intact. `latest` is the newest
+release; for a particular version, use `download/v0.1.0` in place of
+`latest/download`. If your login nodes can't reach GitHub, download the two
+files on your own machine and copy them over with `scp`.
+
+### Or build a static binary on your workstation
 
 On a Linux or macOS machine with [Rust](https://rustup.rs) and Docker (or
 `musl-tools` on Ubuntu):
@@ -78,7 +101,9 @@ stomp 0.1.0
 
 ## Updating
 
-Replace `~/bin/stomp` with the new file. Your config
+Replace `~/bin/stomp` with the new file: [download the
+release](#download-a-release) the same way, and it overwrites the old one.
+`stomp --version` shows which one you have. Your config
 (`~/.config/stomp/config.toml`) and data (`~/.local/share/stomp/`) stay where
 they are, and a newer stomp upgrades its catalog automatically the first time
 it opens it. If you use the daily run, the next run picks up the new binary.
