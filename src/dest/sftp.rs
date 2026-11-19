@@ -52,6 +52,11 @@ fn quote(path: &str) -> String {
 /// which sftp and ssh both resolve from where they log in. `$VAR`s are
 /// expanded here, so `$USER` works.
 fn remote_base(path: &str) -> Result<String> {
+    remote_base_with(path, |name| std::env::var(name).ok())
+}
+
+/// Like [`remote_base`], with the environment supplied by the caller.
+fn remote_base_with(path: &str, var: impl Fn(&str) -> Option<String>) -> Result<String> {
     let (home_relative, rest) = match path {
         "~" => (true, ""),
         _ => match path.strip_prefix("~/") {
@@ -59,7 +64,7 @@ fn remote_base(path: &str) -> Result<String> {
             None => (false, path),
         },
     };
-    let expanded = crate::paths::expand(rest)?;
+    let expanded = crate::paths::expand_with(rest, &crate::paths::home_dir()?, var)?;
     let base = expanded.to_string_lossy().trim_end_matches('/').to_string();
     Ok(match (home_relative, base.is_empty()) {
         (true, true) => ".".to_string(),
