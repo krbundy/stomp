@@ -4,7 +4,10 @@ A storage management utility for HPC users. stomp runs as you, with no root or
 admin help, and attributes your storage and Slurm jobs to the research grants
 that pay for them.
 
-The full design is in [`spec/design.md`](spec/design.md). Milestones M1 through
+The full design is in [`spec/design.md`](spec/design.md). The user
+documentation, with tutorials and a complete command and configuration
+reference, is a [Zola](https://www.getzola.org) site in [`docs/`](docs/), built
+for <https://stomp.psae.us>; preview it with `zola serve` in that directory. Milestones M1 through
 M5 and M7 are done (M6, cold storage, is deferred):
 
 | Command | What it does |
@@ -25,8 +28,8 @@ M5 and M7 are done (M6, cold storage, is deferred):
 | `stomp report reclaimable` | Caches and environments, with commands to slim them down |
 | `stomp report lifecycle` | Grants that have ended or are about to, and what they still use |
 | `stomp archive DIR` | Packs a directory into compressed, verified chunks and removes the originals; `--to nas` sends the chunks to a destination |
-| `stomp archives` | Lists archives; `show`, `verify [--deep]` and `move --to DEST` |
-| `stomp restore ID` | Puts archived files back, all of them or `--only` some, downloading chunks as needed |
+| `stomp archives` | Lists archives; `show`, `verify [--deep]`, `move --to DEST`, and `delete` for a copy kept after a restore |
+| `stomp restore ID` | Puts archived files back, all of them or `--only` some, downloading chunks as needed; `--dry-run` shows the plan, and restoring all of an unfinished archive undoes it |
 | `stomp candidates` | Directories your policies propose to archive, with what archiving would free; `dismiss ID` |
 | `stomp apply ID...` | Archives proposed directories, each checked again first |
 | `stomp schedule enable` | A small daily Slurm job: usage, accounting, a weekly scan, proposals; `status`, `disable` |

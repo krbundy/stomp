@@ -1,0 +1,34 @@
+# The URL the site will be built for
+base_url = "https://stomp.psae.us"
+title = "stomp"
+description = "Track storage and compute per research grant on HPC clusters, and archive what you're done with."
+default_language = "en"
+
+# Whether to automatically compile all Sass files in the sass directory
+compile_sass = true
+
+# Whether to build a search index to be used later on by a JavaScript library
+build_search_index = true
+
+[search]
+include_title = true
+include_description = true
+include_content = true
+
+[markdown]
+smart_punctuation = true
+external_links_target_blank = true
+external_links_no_referrer = true
+
+[markdown.highlighting]
+theme = "catppuccin-mocha"
+
+[extra]
+repo = "https://github.com/krbundy/stomp"
+# Sections shown in the header and sidebar, in order.
+nav = [
+    { title = "Get started", path = "getting-started" },
+    { title = "Tutorials", path = "tutorials" },
+    { title = "Concepts", path = "concepts" },
+    { title = "Reference", path = "reference" },
+]
