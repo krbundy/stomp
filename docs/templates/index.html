@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+
+{% block body %}
+<main id="main" class="home">
+  <section class="hero">
+    <div class="hero-text">
+      <h1>{{ section.extra.headline }}</h1>
+      <p class="lead">{{ section.extra.tagline }}</p>
+      <p class="actions">
+        <a class="button primary" href="{{ get_url(path='@/getting-started/quick-start.md') }}">Get started</a>
+        <a class="button" href="{{ get_url(path='@/tutorials/_index.md') }}">Tutorials</a>
+      </p>
+    </div>
+    <div class="terminal" aria-label="Example: stomp usage">
+      <div class="terminal-bar"><span></span><span></span><span></span></div>
+<pre><code><span class="prompt">$</span> stomp usage
+Measured 2026-11-18 09:14 EST
+
+ROOT   FILESYSTEM       SIZE       FILES   QUOTA
+~      CephFS       11.8 TiB   9,412,881   none set
+
+GRANT          DIRS        SIZE       FILES   LAST CHANGE
+NSF-2231          2     6.2 TiB   4,102,553   2h ago
+USDA-1180         1     3.9 TiB   3,877,014   141d ago
+EPSCOR-T2         1     1.1 TiB     612,077   3d ago
+(unassigned)      —   612.4 GiB     821,237   just now
+---------------------------------------------------------
+TOTAL                  11.8 TiB   9,412,881   just now</code></pre>
+    </div>
+  </section>
+
+  <section class="features">
+    {% for f in section.extra.features %}
+    <a class="feature" href="{{ get_url(path=f.link) }}">
+      <h2>{{ f.title }}</h2>
+      <p>{{ f.text | markdown(inline=true) | safe }}</p>
+    </a>
+    {% endfor %}
+  </section>
+
+  <section class="home-prose prose">
+    {{ section.content | safe }}
+  </section>
+</main>
+{% endblock %}

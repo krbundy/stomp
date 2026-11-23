@@ -1,0 +1,79 @@
+# Builds the documentation site in docs/ with Zola. Pull requests check that
+# it builds and its internal links resolve; pushes to main also publish it to
+# GitHub Pages.
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**', '.github/workflows/docs.yml']
+  pull_request:
+    paths: ['docs/**', '.github/workflows/docs.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to main waits for a deployment in progress rather than
+# cancelling it halfway.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Zola
+        env:
+          ZOLA_VERSION: 0.22.1
+          ZOLA_SHA256: 0ca09aa40376aaa9ddfb512ff9ad963262ef95edb0d0f2d5ec6961b6f5cf22ef
+        run: |
+          tarball=zola-v$ZOLA_VERSION-x86_64-unknown-linux-gnu.tar.gz
+          curl -sSfLO "https://github.com/getzola/zola/releases/download/v$ZOLA_VERSION/$tarball"
+          echo "$ZOLA_SHA256  $tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zola"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/zola" zola
+          echo "$RUNNER_TEMP/zola" >> "$GITHUB_PATH"
+
+      - name: Check internal links
+        working-directory: docs
+        run: zola check --skip-external-links
+
+      - name: Configure Pages
+        id: pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v6
+
+      # Build for the address Pages serves the site from, so a custom domain
+      # set in the repository settings needs no change here.
+      - name: Build
+        working-directory: docs
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: zola build ${BASE_URL:+--base-url "$BASE_URL"}
+
+      - name: Upload the site
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/public
+
+  deploy:
+    name: Publish
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

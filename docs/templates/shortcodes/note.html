@@ -1,0 +1,6 @@
+{#- A callout. kind: note (default), tip, warning. Optional title. -#}
+{%- set kind = kind | default(value="note") -%}
+<div class="callout callout-{{ kind }}" role="note">
+  <p class="callout-title">{{ title | default(value=kind | capitalize) }}</p>
+  {{ body | markdown | safe }}
+</div>

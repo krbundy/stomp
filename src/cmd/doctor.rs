@@ -1,0 +1,410 @@
+//! `stomp doctor`: checks stomp's configuration and environment.
+
+use std::fmt::Display;
+use std::fs;
+use std::path::Path;
+
+use anyhow::Result;
+
+use crate::catalog::Catalog;
+use crate::config::{Config, Destination};
+use crate::dest::Check;
+use crate::fs as sfs;
+use crate::units::{format_bytes, format_count};
+use crate::{archive, cmd, compute, jobs, paths, scan, sys, tasks};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Pass,
+    Info,
+    Warn,
+    Fail,
+}
+
+#[derive(Default)]
+struct Report {
+    failures: usize,
+    warnings: usize,
+}
+
+impl Report {
+    fn line(&mut self, status: Status, topic: &str, message: impl Display) {
+        let tag = match status {
+            Status::Pass => "ok  ",
+            Status::Info => "info",
+            Status::Warn => "warn",
+            Status::Fail => "FAIL",
+        };
+        match status {
+            Status::Fail => self.failures += 1,
+            Status::Warn => self.warnings += 1,
+            _ => {}
+        }
+        println!("{tag}  {topic:<12} {message}");
+    }
+}
+
+/// Runs the checks and prints a line for each. Returns false if anything
+/// failed. `online` also connects to each destination.
+pub fn run(config_path: &Path, data_dir: &Path, online: bool) -> Result<bool> {
+    let mut r = Report::default();
+    let config = check_config(&mut r, config_path);
+    check_state(&mut r, data_dir);
+    if let Some(cfg) = &config {
+        check_roots(&mut r, cfg);
+    }
+    check_slurm(&mut r, config.as_ref());
+    if let Some(cfg) = &config {
+        check_destinations(&mut r, cfg, online);
+        check_policies(&mut r, cfg, data_dir);
+    }
+
+    println!();
+    match (r.failures, r.warnings) {
+        (0, 0) => println!("No problems found."),
+        (0, w) => println!("No failures; {w} warning(s) to look at."),
+        (f, w) => println!("{f} failure(s) and {w} warning(s)."),
+    }
+    Ok(r.failures == 0)
+}
+
+fn check_config(r: &mut Report, config_path: &Path) -> Option<Config> {
+    let shown = paths::display(config_path);
+    match Config::load(config_path) {
+        Ok(cfg) => {
+            r.line(
+                Status::Pass,
+                "config",
+                format!(
+                    "{shown}: {} grant(s), {} root(s), {} destination(s)",
+                    cfg.grants.len(),
+                    cfg.roots.len(),
+                    cfg.destinations.len()
+                ),
+            );
+            for w in &cfg.warnings {
+                r.line(Status::Warn, "config", w);
+            }
+            Some(cfg)
+        }
+        Err(e) => {
+            for problem in &e.problems {
+                r.line(Status::Fail, "config", format!("{shown}: {problem}"));
+            }
+            for w in &e.warnings {
+                r.line(Status::Warn, "config", w);
+            }
+            None
+        }
+    }
+}
+
+fn check_state(r: &mut Report, data_dir: &Path) {
+    let shown = paths::display(data_dir);
+    match check_writable(data_dir) {
+        Ok(()) => r.line(Status::Pass, "data dir", format!("{shown} is writable")),
+        Err(e) => r.line(Status::Fail, "data dir", format!("{shown}: {e}")),
+    }
+    // Doctor looks without importing, so it can report what's waiting.
+    match Catalog::open(data_dir) {
+        Ok(catalog) => {
+            let size = fs::metadata(catalog.path()).map_or(0, |m| m.len());
+            let count = |n: Result<i64>| format_count(n.unwrap_or(0).max(0) as u64);
+            r.line(
+                Status::Pass,
+                "catalog",
+                format!(
+                    "{}: {} measurement(s), {} scan(s), {} job record(s)",
+                    format_bytes(size),
+                    count(catalog.measurement_count()),
+                    count(catalog.scan_count()),
+                    count(catalog.job_count())
+                ),
+            );
+            match compute::last_sync(&catalog) {
+                Ok(Some(t)) => r.line(
+                    Status::Info,
+                    "accounting",
+                    format!("last imported from sacct {}", cmd::age(Some(t))),
+                ),
+                Ok(None) => r.line(
+                    Status::Info,
+                    "accounting",
+                    "not imported yet; `stomp jobs sync` does it",
+                ),
+                Err(_) => {}
+            }
+        }
+        Err(e) => r.line(Status::Fail, "catalog", format!("{e:#}")),
+    }
+    let waiting = |dir: &Path| {
+        fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        })
+    };
+    for (topic, dir, what) in [
+        ("job logs", jobs::inbox_dir(data_dir), "job record(s)"),
+        (
+            "archives",
+            archive::inbox_dir(data_dir),
+            "archive record(s)",
+        ),
+    ] {
+        let n = waiting(&dir);
+        if n > 0 {
+            r.line(
+                Status::Info,
+                topic,
+                format!("{n} {what} waiting to be imported; `stomp ingest`, `stomp tasks` or any report imports them"),
+            );
+        }
+    }
+    if let Ok(results) = scan::list_results(&scan::inbox_dir(data_dir)) {
+        let done = results
+            .iter()
+            .filter(|r| r.meta.status == "complete")
+            .count();
+        let running = results.iter().filter(|r| r.is_running()).count();
+        let interrupted: Vec<_> = results.iter().filter(|r| r.is_interrupted()).collect();
+        if done > 0 {
+            r.line(
+                Status::Info,
+                "scans",
+                format!("{done} finished scan(s) waiting to be imported; `stomp ingest`, `stomp tasks` or any report imports them"),
+            );
+        }
+        if running > 0 {
+            r.line(Status::Info, "scans", format!("{running} scan(s) running"));
+        }
+        if !interrupted.is_empty() {
+            r.line(
+                Status::Warn,
+                "scans",
+                format!(
+                    "{} interrupted scan(s); `stomp scan --resume` continues the latest",
+                    interrupted.len()
+                ),
+            );
+        }
+    }
+    if let Ok(all) = tasks::list(data_dir) {
+        let active = all.iter().filter(|t| !t.status.is_final()).count();
+        if active > 0 {
+            r.line(
+                Status::Info,
+                "tasks",
+                format!("{active} task(s) submitted or running; see `stomp tasks`"),
+            );
+        }
+    }
+    if let Ok(catalog) = Catalog::open(data_dir)
+        && let Ok(archives) = catalog.archives()
+    {
+        for a in archives.iter().filter(|a| a.state == "in-progress") {
+            r.line(
+                Status::Warn,
+                "archives",
+                format!(
+                    "archiving {} ({}) hasn't finished; `stomp archive --resume` continues it",
+                    paths::display(Path::new(&a.source)),
+                    a.id
+                ),
+            );
+        }
+    }
+}
+
+fn check_writable(dir: &Path) -> std::io::Result<()> {
+    paths::create_private_dir(dir)?;
+    let probe = dir.join(format!(".doctor-{}", std::process::id()));
+    fs::write(&probe, b"ok")?;
+    fs::remove_file(&probe)
+}
+
+fn check_roots(r: &mut Report, cfg: &Config) {
+    for root in &cfg.roots {
+        let shown = paths::display(root);
+        let backend = match sfs::detect(root) {
+            Ok(b) => b,
+            Err(e) => {
+                r.line(Status::Fail, "filesystem", format!("{shown}: {e}"));
+                continue;
+            }
+        };
+        if !backend.is_instant() {
+            r.line(
+                Status::Info,
+                "filesystem",
+                format!("{shown} is not CephFS, so measuring it means walking every file"),
+            );
+            continue;
+        }
+        r.line(
+            Status::Pass,
+            "filesystem",
+            format!("{shown} is CephFS, so usage is instant"),
+        );
+        match backend.quota(root) {
+            Ok(Some(q)) => {
+                let mut limits = Vec::new();
+                if let Some(max) = q.max_bytes {
+                    limits.push(format!(
+                        "{} of {}",
+                        format_bytes(q.used.bytes),
+                        format_bytes(max)
+                    ));
+                }
+                if let Some(max) = q.max_files {
+                    limits.push(format!(
+                        "{} of {} files",
+                        format_count(q.used.files),
+                        format_count(max)
+                    ));
+                }
+                r.line(
+                    Status::Pass,
+                    "quota",
+                    format!(
+                        "{} used, set on {}",
+                        limits.join(", "),
+                        paths::display(&q.dir)
+                    ),
+                );
+            }
+            Ok(None) => r.line(
+                Status::Info,
+                "quota",
+                format!("no CephFS quota on {shown} or the directories above it"),
+            ),
+            Err(e) => r.line(Status::Warn, "quota", format!("{shown}: {e}")),
+        }
+    }
+}
+
+fn check_slurm(r: &mut Report, cfg: Option<&Config>) {
+    let missing: Vec<&str> = ["sbatch", "squeue", "sacct"]
+        .into_iter()
+        .filter(|tool| sys::which(tool).is_none())
+        .collect();
+    if missing.is_empty() {
+        r.line(Status::Pass, "slurm", "sbatch, squeue and sacct found");
+    } else {
+        r.line(
+            Status::Warn,
+            "slurm",
+            format!(
+                "not found: {} (needed for tasks and compute reports)",
+                missing.join(", ")
+            ),
+        );
+    }
+    if sys::which("scrontab").is_some() {
+        r.line(
+            Status::Pass,
+            "slurm",
+            "scrontab found; recurring work can use it if the site allows",
+        );
+    } else {
+        r.line(
+            Status::Info,
+            "slurm",
+            "scrontab not found; recurring work will use self-resubmitting tasks",
+        );
+    }
+    if let Ok(job) = std::env::var("SLURM_JOB_ID") {
+        r.line(Status::Info, "slurm", format!("running inside job {job}"));
+    }
+    let configured = cfg.map_or(8, |c| c.scan.max_threads);
+    r.line(
+        Status::Info,
+        "threads",
+        format!("{} worker thread(s)", sys::effective_threads(configured)),
+    );
+}
+
+fn check_destinations(r: &mut Report, cfg: &Config, online: bool) {
+    if cfg
+        .destinations
+        .iter()
+        .any(|d| matches!(d, Destination::Sftp(_)))
+    {
+        for tool in ["ssh", "sftp"] {
+            if sys::which(tool).is_none() {
+                r.line(
+                    Status::Fail,
+                    "openssh",
+                    format!("{tool} not found; SFTP destinations need OpenSSH"),
+                );
+            }
+        }
+    }
+    for d in &cfg.destinations {
+        let topic = format!("{} ({})", d.name(), d.kind());
+        if !online {
+            r.line(Status::Info, &topic, "not checked (--offline)");
+            continue;
+        }
+        let dest = match crate::dest::open(cfg, d.name()) {
+            Ok(dest) => dest,
+            Err(e) => {
+                r.line(Status::Fail, &topic, format!("{e:#}"));
+                continue;
+            }
+        };
+        for check in dest.check() {
+            match check {
+                Check::Pass(m) => r.line(Status::Pass, &topic, m),
+                Check::Info(m) => r.line(Status::Info, &topic, m),
+                Check::Warn(m) => r.line(Status::Warn, &topic, m),
+                Check::Fail(m) => r.line(Status::Fail, &topic, m),
+            }
+        }
+    }
+    if !cfg.destinations.is_empty() && std::env::var_os("SLURM_JOB_ID").is_none() {
+        r.line(
+            Status::Info,
+            "destinations",
+            "checked from this node; `stomp doctor --submit` checks from a compute node",
+        );
+    }
+}
+
+fn check_policies(r: &mut Report, cfg: &Config, data_dir: &Path) {
+    let scheduled = super::schedule::enabled(data_dir);
+    if let Some(problem) = super::schedule::health(data_dir) {
+        r.line(Status::Warn, "schedule", problem);
+    } else if scheduled {
+        r.line(Status::Pass, "schedule", "daily runs are on");
+    } else {
+        r.line(
+            Status::Info,
+            "schedule",
+            "daily runs are off; `stomp schedule enable` keeps usage, accounting, scans and proposals current",
+        );
+    }
+    if cfg.policies.is_empty() {
+        return;
+    }
+    let automatic = cfg
+        .policies
+        .iter()
+        .filter(|p| p.action == crate::config::PolicyAction::Apply)
+        .count();
+    let text = format!(
+        "{} polic{}, {automatic} archiving automatically",
+        cfg.policies.len(),
+        if cfg.policies.len() == 1 { "y" } else { "ies" }
+    );
+    if automatic > 0 && !scheduled {
+        r.line(
+            Status::Warn,
+            "policies",
+            format!("{text}, but nothing runs them until `stomp schedule enable`"),
+        );
+    } else {
+        r.line(Status::Pass, "policies", text);
+    }
+}
